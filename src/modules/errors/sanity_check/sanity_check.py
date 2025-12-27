@@ -138,6 +138,14 @@ def fill_negatives_market(
                     break
 
             if len(prev_valid_indices) == 0:
+                corrections.append({
+                    'ticker': ticker,
+                    'column': col,
+                    'date': dates[idx],
+                    'original_value': original_value,
+                    'corrected_value': None,
+                    'method': 'skipped_no_previous_valid'
+                })
                 continue
 
             if len(prev_valid_indices) < 3:
