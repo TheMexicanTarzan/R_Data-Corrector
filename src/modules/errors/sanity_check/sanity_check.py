@@ -615,7 +615,7 @@ def ohlc_integrity(
     Validate and resolve OHLC data integrity issues:
     - High must be >= max(Open, Close, Low) -> resolved by setting High = max
     - Low must be <= min(Open, Close, High) -> resolved by setting Low = min
-    - VWAP must be within [Low, High] -> resolved by setting VWAP = (O+H+L+C)/4
+    - VWAP must be within [Low, High] -> resolved by set VWAP = (O+H+L+C)/4
 
     Checks are performed on three column groups:
     - Raw OHLC
@@ -860,4 +860,359 @@ def ohlc_integrity(
     corrected_lf = working_lf.with_columns(correction_exprs)
 
     return (corrected_lf, resolutions)
+
+
+def validate_financial_equivalencies(
+    df: Union[polars.DataFrame, polars.LazyFrame],
+    ticker: str,
+    columns: list[str] = [""],
+    date_col: str = "m_date",
+    tolerance: float = 1.0
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict]:
+    """
+    Validate and clean financial statement data by enforcing accounting identities.
+
+    Performs two types of validations:
+    1. Hard Filters: Structural equations that are corrected via proportional scaling
+       - Assets = Current Assets + Noncurrent Assets
+       - Liabilities = Current Liabilities + Noncurrent Liabilities
+
+    2. Soft Filters: Logical checks that flag warnings without modifying data
+       - Stockholder Equity = Common Stock + APIC + Retained Earnings + Other Equity
+       - Period End Cash = Cash and Cash Equivalents
+
+    Args:
+        df: Input DataFrame or LazyFrame with financial data
+        ticker: Ticker symbol for logging purposes
+        columns: Unused, kept for backward compatibility with parallel_process_tickers
+        date_col: Name of the date column (default: 'm_date')
+        tolerance: Tolerance for floating-point comparisons (default: 1.0)
+
+    Returns:
+        tuple containing:
+            - Cleaned DataFrame/LazyFrame (same type as input)
+            - Dictionary with keys 'hard_filter_errors' and 'soft_filter_warnings',
+              each containing lists of error dictionaries
+
+    Note:
+        Hard filter corrections use proportional scaling:
+        - Factor = Total / (Current + Noncurrent)
+        - NewComponent = OldComponent * Factor
+        - Edge case: If components sum to 0 but total != 0, value goes to noncurrent
+    """
+    is_lazy = isinstance(df, polars.LazyFrame)
+    working_lf = df if is_lazy else df.lazy()
+
+    # Get schema to check column existence
+    schema_cols = set(working_lf.collect_schema().names())
+
+    # Define required columns for hard and soft filters
+    hard_filter_columns = {
+        "assets": ["fbs_assets", "fbs_current_assets", "fbs_noncurrent_assets"],
+        "liabilities": ["fbs_liabilities", "fbs_current_liabilities", "fbs_noncurrent_liabilities"]
+    }
+
+    soft_filter_columns = {
+        "equity": [
+            "fbs_stockholder_equity",
+            "fbs_common_stock_value",
+            "fbs_additional_paid_in_capital",
+            "fbs_retained_earnings",
+            "fbs_other_stockholder_equity"
+        ],
+        "cash": ["fcf_period_end_cash", "fbs_cash_and_cash_equivalents"]
+    }
+
+    # Initialize error log structure
+    error_log = {
+        "hard_filter_errors": [],
+        "soft_filter_warnings": []
+    }
+
+    # ==================== HARD FILTERS ====================
+    # Track violation flags and correction expressions
+    hard_violation_exprs = []
+    hard_correction_exprs = []
+    hard_violation_info = []
+    columns_for_hard_logging = {date_col}
+
+    # Process Assets identity
+    if all(col in schema_cols for col in hard_filter_columns["assets"]):
+        total_col = "fbs_assets"
+        current_col = "fbs_current_assets"
+        noncurrent_col = "fbs_noncurrent_assets"
+
+        columns_for_hard_logging.update([total_col, current_col, noncurrent_col])
+
+        # Calculate sum of components
+        component_sum = polars.col(current_col) + polars.col(noncurrent_col)
+
+        # Identify violations (absolute difference > tolerance)
+        assets_violation = (polars.col(total_col) - component_sum).abs() > tolerance
+
+        # Calculate scaling factor
+        scaling_factor = polars.when(component_sum != 0).then(
+            polars.col(total_col) / component_sum
+        ).otherwise(polars.lit(None))
+
+        # Create correction expressions
+        # Edge case: if sum is 0 but total is not, dump into noncurrent
+        new_current = polars.when(assets_violation).then(
+            polars.when(component_sum != 0).then(
+                polars.col(current_col) * scaling_factor
+            ).otherwise(polars.lit(0.0))
+        ).otherwise(polars.col(current_col))
+
+        new_noncurrent = polars.when(assets_violation).then(
+            polars.when(component_sum != 0).then(
+                polars.col(noncurrent_col) * scaling_factor
+            ).otherwise(polars.col(total_col))  # Edge case: dump to noncurrent
+        ).otherwise(polars.col(noncurrent_col))
+
+        # Add to tracking lists
+        violation_flag_name = "_viol_assets"
+        hard_violation_exprs.append(assets_violation.alias(violation_flag_name))
+        hard_correction_exprs.extend([
+            new_current.alias(current_col),
+            new_noncurrent.alias(noncurrent_col)
+        ])
+        hard_violation_info.append({
+            "flag": violation_flag_name,
+            "error_type": "assets_mismatch",
+            "total_col": total_col,
+            "current_col": current_col,
+            "noncurrent_col": noncurrent_col
+        })
+
+    # Process Liabilities identity
+    if all(col in schema_cols for col in hard_filter_columns["liabilities"]):
+        total_col = "fbs_liabilities"
+        current_col = "fbs_current_liabilities"
+        noncurrent_col = "fbs_noncurrent_liabilities"
+
+        columns_for_hard_logging.update([total_col, current_col, noncurrent_col])
+
+        # Calculate sum of components
+        component_sum = polars.col(current_col) + polars.col(noncurrent_col)
+
+        # Identify violations (absolute difference > tolerance)
+        liabilities_violation = (polars.col(total_col) - component_sum).abs() > tolerance
+
+        # Calculate scaling factor
+        scaling_factor = polars.when(component_sum != 0).then(
+            polars.col(total_col) / component_sum
+        ).otherwise(polars.lit(None))
+
+        # Create correction expressions
+        new_current = polars.when(liabilities_violation).then(
+            polars.when(component_sum != 0).then(
+                polars.col(current_col) * scaling_factor
+            ).otherwise(polars.lit(0.0))
+        ).otherwise(polars.col(current_col))
+
+        new_noncurrent = polars.when(liabilities_violation).then(
+            polars.when(component_sum != 0).then(
+                polars.col(noncurrent_col) * scaling_factor
+            ).otherwise(polars.col(total_col))  # Edge case: dump to noncurrent
+        ).otherwise(polars.col(noncurrent_col))
+
+        # Add to tracking lists
+        violation_flag_name = "_viol_liabilities"
+        hard_violation_exprs.append(liabilities_violation.alias(violation_flag_name))
+        hard_correction_exprs.extend([
+            new_current.alias(current_col),
+            new_noncurrent.alias(noncurrent_col)
+        ])
+        hard_violation_info.append({
+            "flag": violation_flag_name,
+            "error_type": "liabilities_mismatch",
+            "total_col": total_col,
+            "current_col": current_col,
+            "noncurrent_col": noncurrent_col
+        })
+
+    # Log hard filter violations before correction
+    if hard_violation_exprs:
+        any_hard_violation = polars.any_horizontal(
+            *[polars.col(info["flag"]) for info in hard_violation_info]
+        )
+
+        hard_error_rows_df = (
+            working_lf
+            .select(list(columns_for_hard_logging))
+            .with_columns(hard_violation_exprs)
+            .filter(any_hard_violation)
+            .collect()
+        )
+
+        if not hard_error_rows_df.is_empty():
+            error_rows = hard_error_rows_df.to_dicts()
+
+            for row in error_rows:
+                for info in hard_violation_info:
+                    if not row.get(info["flag"]):
+                        continue
+
+                    total_col = info["total_col"]
+                    current_col = info["current_col"]
+                    noncurrent_col = info["noncurrent_col"]
+
+                    total_val = row.get(total_col)
+                    current_val = row.get(current_col)
+                    noncurrent_val = row.get(noncurrent_col)
+                    component_sum_val = current_val + noncurrent_val
+
+                    error_entry = {
+                        "ticker": ticker,
+                        "date": row.get(date_col),
+                        "error_type": info["error_type"],
+                        "total": total_val,
+                        "current": current_val,
+                        "noncurrent": noncurrent_val,
+                        "component_sum": component_sum_val,
+                        "difference": total_val - component_sum_val
+                    }
+
+                    # Calculate corrected values
+                    if component_sum_val != 0:
+                        factor = total_val / component_sum_val
+                        error_entry["corrected_current"] = current_val * factor
+                        error_entry["corrected_noncurrent"] = noncurrent_val * factor
+                        error_entry["correction_method"] = "proportional_scaling"
+                    else:
+                        error_entry["corrected_current"] = 0.0
+                        error_entry["corrected_noncurrent"] = total_val
+                        error_entry["correction_method"] = "residual_plug"
+
+                    error_log["hard_filter_errors"].append(error_entry)
+
+        # Apply hard filter corrections
+        working_lf = working_lf.with_columns(hard_correction_exprs)
+
+    # ==================== SOFT FILTERS ====================
+    # Track violation flags for soft filters
+    soft_violation_exprs = []
+    soft_violation_info = []
+    columns_for_soft_logging = {date_col}
+
+    # Process Stockholder Equity identity
+    if all(col in schema_cols for col in soft_filter_columns["equity"]):
+        total_col = "fbs_stockholder_equity"
+        component_cols = [
+            "fbs_common_stock_value",
+            "fbs_additional_paid_in_capital",
+            "fbs_retained_earnings",
+            "fbs_other_stockholder_equity"
+        ]
+
+        columns_for_soft_logging.update([total_col] + component_cols)
+
+        # Calculate sum of components
+        component_sum = sum(polars.col(col) for col in component_cols)
+
+        # Identify violations
+        equity_violation = (polars.col(total_col) - component_sum).abs() > tolerance
+
+        violation_flag_name = "_warn_equity"
+        soft_violation_exprs.append(equity_violation.alias(violation_flag_name))
+        soft_violation_info.append({
+            "flag": violation_flag_name,
+            "error_type": "equity_mismatch",
+            "total_col": total_col,
+            "component_cols": component_cols
+        })
+
+    # Process Cash equivalency check
+    if all(col in schema_cols for col in soft_filter_columns["cash"]):
+        cash_col_1 = "fcf_period_end_cash"
+        cash_col_2 = "fbs_cash_and_cash_equivalents"
+
+        columns_for_soft_logging.update([cash_col_1, cash_col_2])
+
+        # Identify violations
+        cash_violation = (polars.col(cash_col_1) - polars.col(cash_col_2)).abs() > tolerance
+
+        violation_flag_name = "_warn_cash"
+        soft_violation_exprs.append(cash_violation.alias(violation_flag_name))
+        soft_violation_info.append({
+            "flag": violation_flag_name,
+            "error_type": "cash_mismatch",
+            "cash_col_1": cash_col_1,
+            "cash_col_2": cash_col_2
+        })
+
+    # Log soft filter violations and create data_warning column
+    data_warning_expr = polars.lit(False)
+
+    if soft_violation_exprs:
+        # Create warning flag: True if any soft filter violation
+        data_warning_expr = polars.any_horizontal(
+            *[polars.col(info["flag"]) for info in soft_violation_info]
+        )
+
+        soft_error_rows_df = (
+            working_lf
+            .select(list(columns_for_soft_logging))
+            .with_columns(soft_violation_exprs)
+            .filter(data_warning_expr)
+            .collect()
+        )
+
+        if not soft_error_rows_df.is_empty():
+            error_rows = soft_error_rows_df.to_dicts()
+
+            for row in error_rows:
+                for info in soft_violation_info:
+                    if not row.get(info["flag"]):
+                        continue
+
+                    warning_entry = {
+                        "ticker": ticker,
+                        "date": row.get(date_col),
+                        "error_type": info["error_type"]
+                    }
+
+                    if info["error_type"] == "equity_mismatch":
+                        total_col = info["total_col"]
+                        component_cols = info["component_cols"]
+
+                        total_val = row.get(total_col)
+                        component_vals = {col: row.get(col) for col in component_cols}
+                        component_sum_val = sum(component_vals.values())
+
+                        warning_entry["total"] = total_val
+                        warning_entry["components"] = component_vals
+                        warning_entry["component_sum"] = component_sum_val
+                        warning_entry["difference"] = total_val - component_sum_val
+
+                    elif info["error_type"] == "cash_mismatch":
+                        cash_col_1 = info["cash_col_1"]
+                        cash_col_2 = info["cash_col_2"]
+
+                        val_1 = row.get(cash_col_1)
+                        val_2 = row.get(cash_col_2)
+
+                        warning_entry[cash_col_1] = val_1
+                        warning_entry[cash_col_2] = val_2
+                        warning_entry["difference"] = val_1 - val_2
+
+                    error_log["soft_filter_warnings"].append(warning_entry)
+
+        # Add temporary violation flags to calculate data_warning
+        working_lf = working_lf.with_columns(soft_violation_exprs)
+
+    # Add data_warning column to the dataframe
+    working_lf = working_lf.with_columns(
+        data_warning_expr.alias("data_warning")
+    )
+
+    # Clean up temporary violation flag columns (only soft filter flags were added)
+    if soft_violation_exprs:
+        soft_flags_to_drop = [info["flag"] for info in soft_violation_info]
+        working_lf = working_lf.drop(soft_flags_to_drop)
+
+    # Return in the same format as input
+    result_df = working_lf if is_lazy else working_lf.collect()
+
+    return (result_df, error_log)
 
