@@ -59,14 +59,28 @@ def sort_dates(
 
     is_lazy = isinstance(df, polars.LazyFrame)
 
-    # Create temporary columns cast to Date type to ensure chronological sorting
-    # This handles cases where dates might be stored as strings
+    # Create temporary columns for sorting
+    # Handle both Date columns and string columns with various date formats
     primary_sort_col = sort_columns[0]
     temp_sort_cols = [f"_sort_{col}" for col in sort_columns]
-    cast_expressions = [
-        polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
-        for col in sort_columns
-    ]
+
+    # Build cast expressions that handle multiple date formats for string columns
+    cast_expressions = []
+    for col in sort_columns:
+        # Try multiple approaches: direct cast, then common string date formats
+        # coalesce picks the first non-null result
+        expr = polars.coalesce(
+            # Try direct cast (works if already Date type or ISO format string)
+            polars.col(col).cast(polars.Date, strict=False),
+            # Try common string date formats
+            polars.col(col).str.to_date("%Y-%m-%d", strict=False),      # ISO: 2020-11-10
+            polars.col(col).str.to_date("%m/%d/%Y", strict=False),      # US: 11/10/2020
+            polars.col(col).str.to_date("%d/%m/%Y", strict=False),      # EU: 10/11/2020
+            polars.col(col).str.to_date("%Y/%m/%d", strict=False),      # Alt: 2020/11/10
+            polars.col(col).str.to_date("%m-%d-%Y", strict=False),      # US dash: 11-10-2020
+            polars.col(col).str.to_date("%d-%m-%Y", strict=False),      # EU dash: 10-11-2020
+        ).alias(f"_sort_{col}")
+        cast_expressions.append(expr)
 
     # Add original index and cast date columns
     df_with_idx = (
@@ -144,10 +158,18 @@ def sort_dates(
             # Create temporary sort columns for deduplication sorting
             dedupe_sort_cols = [date_col, declaration_col]
             temp_dedupe_cols = [f"_sort_{col}" for col in dedupe_sort_cols]
-            dedupe_cast_exprs = [
-                polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
-                for col in dedupe_sort_cols
-            ]
+            dedupe_cast_exprs = []
+            for col in dedupe_sort_cols:
+                expr = polars.coalesce(
+                    polars.col(col).cast(polars.Date, strict=False),
+                    polars.col(col).str.to_date("%Y-%m-%d", strict=False),
+                    polars.col(col).str.to_date("%m/%d/%Y", strict=False),
+                    polars.col(col).str.to_date("%d/%m/%Y", strict=False),
+                    polars.col(col).str.to_date("%Y/%m/%d", strict=False),
+                    polars.col(col).str.to_date("%m-%d-%Y", strict=False),
+                    polars.col(col).str.to_date("%d-%m-%Y", strict=False),
+                ).alias(f"_sort_{col}")
+                dedupe_cast_exprs.append(expr)
 
             if dedupe_strategy == "earliest":
                 result_df = (
