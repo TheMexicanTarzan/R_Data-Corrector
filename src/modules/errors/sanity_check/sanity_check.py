@@ -58,9 +58,6 @@ def sort_dates(
         return df, logs
 
     is_lazy = isinstance(df, polars.LazyFrame)
-
-    # Create temporary columns for sorting
-    # Handle both Date columns and string columns in MM/DD/YYYY format
     primary_sort_col = sort_columns[0]
     temp_sort_cols = [f"_sort_{col}" for col in sort_columns]
 
@@ -72,36 +69,34 @@ def sort_dates(
     for col in sort_columns:
         col_dtype = schema.get(col)
         if col_dtype == polars.String or col_dtype == polars.Utf8:
-            # For string columns, parse as MM/DD/YYYY
             expr = polars.col(col).str.to_date("%m/%d/%Y", strict=False).alias(f"_sort_{col}")
         else:
-            # For Date columns or other types, cast to Date (no-op if already Date)
             expr = polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
         cast_expressions.append(expr)
 
-    # Add original index and cast date columns
-    df_with_idx = (
+    # Add original index and cast date columns, then collect ONCE
+    df_collected = (
         df.lazy()
         .with_row_index("_original_idx")
         .with_columns(cast_expressions)
+        .collect()
     )
 
-    # Identify rows with valid (non-null) primary sort column
-    # We only sort non-null rows; null rows stay in their original positions
-    # Note: Check the ORIGINAL column for null, not the cast column (cast may fail for some date formats)
-    valid_rows = df_with_idx.filter(polars.col(primary_sort_col).is_not_null()).collect()
-    null_rows = df_with_idx.filter(polars.col(primary_sort_col).is_null()).collect()
+    # Split into valid and null rows using boolean mask (single pass)
+    valid_mask = df_collected[primary_sort_col].is_not_null()
+    valid_rows = df_collected.filter(valid_mask)
+    null_rows = df_collected.filter(~valid_mask)
 
     if valid_rows.height > 0:
-        # Get the original positions of valid rows (these are the slots we'll fill with sorted data)
-        valid_original_positions = valid_rows["_original_idx"].to_list()
+        # Get original positions as Series (avoid Python list conversion)
+        valid_original_positions = valid_rows["_original_idx"].clone()
 
         # Sort valid rows by date columns
         sorted_valid = valid_rows.sort(by=temp_sort_cols)
 
-        # Assign new indices: sorted valid rows get the original valid positions in order
+        # Assign new indices: sorted rows get original valid positions in order
         sorted_valid = sorted_valid.with_columns(
-            polars.Series("_new_idx", valid_original_positions, dtype=polars.UInt32)
+            valid_original_positions.alias("_new_idx")
         )
     else:
         sorted_valid = valid_rows.with_columns(
@@ -114,25 +109,13 @@ def sort_dates(
     )
 
     # Combine and sort by new index to restore proper order
-    combined = polars.concat([sorted_valid, null_rows])
-    df_with_idx = (
-        combined.lazy()
-        .sort("_new_idx")
-        .with_columns(polars.col("_new_idx").alias("_sorted_idx"))
-        .rename({"_new_idx": "_final_idx"})
-    )
+    combined = polars.concat([sorted_valid, null_rows]).sort("_new_idx")
 
     # Detect mismatches (only for valid rows since null rows don't move)
-    # Note: Check the ORIGINAL column for null, not the cast column
-    mismatches = (
-        df_with_idx
-        .filter(
-            (polars.col("_original_idx") != polars.col("_sorted_idx")) &
-            polars.col(primary_sort_col).is_not_null()
-        )
-        .select(["_original_idx", "_sorted_idx"] + sort_columns)
-        .collect()
-    )
+    mismatches = combined.filter(
+        (polars.col("_original_idx") != polars.col("_new_idx")) &
+        polars.col(primary_sort_col).is_not_null()
+    ).select(["_original_idx", "_new_idx"] + sort_columns)
 
     if mismatches.height > 0:
         mismatch_dicts = mismatches.to_dicts()
@@ -140,17 +123,16 @@ def sort_dates(
             row["ticker"] = ticker
             row["error_type"] = "order_mismatch"
             row["original_position"] = row.pop("_original_idx")
-            row["sorted_position"] = row.pop("_sorted_idx")
+            row["sorted_position"] = row.pop("_new_idx")
         logs.extend(mismatch_dicts)
 
-    result_df = df_with_idx.select(
-        polars.all().exclude(["_original_idx", "_sorted_idx", "_final_idx"] + temp_sort_cols)
-    )
+    # Remove temporary columns
+    result_df = combined.drop(["_original_idx", "_new_idx"] + temp_sort_cols)
 
     if dedupe_strategy != "all" and date_col in columns:
         declaration_col = "f_filing_date"
         if declaration_col in columns:
-            pre_dedupe = result_df.select(polars.len()).collect().item()
+            pre_dedupe_count = result_df.height
 
             # Create temporary sort columns for deduplication sorting
             dedupe_sort_cols = [date_col, declaration_col]
@@ -166,36 +148,39 @@ def sort_dates(
 
             if dedupe_strategy == "earliest":
                 result_df = (
-                    result_df
+                    result_df.lazy()
                     .with_columns(dedupe_cast_exprs)
                     .sort(by=temp_dedupe_cols)
                     .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
+                    .collect()
                 )
             elif dedupe_strategy == "latest":
                 result_df = (
-                    result_df
+                    result_df.lazy()
                     .with_columns(dedupe_cast_exprs)
                     .sort(by=temp_dedupe_cols, descending=[False, True])
                     .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
+                    .collect()
                 )
 
             # Final sort by the main sort columns (preserving null positions)
-            result_with_idx = (
+            result_df = (
                 result_df
                 .with_row_index("_orig_idx")
                 .with_columns(cast_expressions)
             )
 
-            valid_dedupe = result_with_idx.filter(polars.col(primary_sort_col).is_not_null()).collect()
-            null_dedupe = result_with_idx.filter(polars.col(primary_sort_col).is_null()).collect()
+            valid_mask_dedupe = result_df[primary_sort_col].is_not_null()
+            valid_dedupe = result_df.filter(valid_mask_dedupe)
+            null_dedupe = result_df.filter(~valid_mask_dedupe)
 
             if valid_dedupe.height > 0:
-                valid_positions = valid_dedupe["_orig_idx"].to_list()
+                valid_positions = valid_dedupe["_orig_idx"].clone()
                 sorted_dedupe = valid_dedupe.sort(by=temp_sort_cols)
                 sorted_dedupe = sorted_dedupe.with_columns(
-                    polars.Series("_new_idx", valid_positions, dtype=polars.UInt32)
+                    valid_positions.alias("_new_idx")
                 )
             else:
                 sorted_dedupe = valid_dedupe.with_columns(
@@ -210,11 +195,9 @@ def sort_dates(
                 polars.concat([sorted_dedupe, null_dedupe])
                 .sort("_new_idx")
                 .drop(["_orig_idx", "_new_idx"] + temp_sort_cols)
-                .lazy()
             )
 
-            post_dedupe = result_df.select(polars.len()).collect().item()
-            removed_count = pre_dedupe - post_dedupe
+            removed_count = pre_dedupe_count - result_df.height
             if removed_count > 0:
                 logs.append(
                     {
@@ -225,8 +208,9 @@ def sort_dates(
                     }
                 )
 
-    if not is_lazy:
-        result_df = result_df.collect()
+    # Convert to lazy if input was lazy
+    if is_lazy:
+        result_df = result_df.lazy()
 
     return result_df, logs
 
