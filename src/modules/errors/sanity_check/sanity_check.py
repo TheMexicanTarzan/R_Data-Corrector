@@ -60,25 +60,17 @@ def sort_dates(
     is_lazy = isinstance(df, polars.LazyFrame)
 
     # Create temporary columns for sorting
-    # Handle both Date columns and string columns with various date formats
+    # Handle both Date columns and string columns in MM/DD/YYYY format
     primary_sort_col = sort_columns[0]
     temp_sort_cols = [f"_sort_{col}" for col in sort_columns]
 
-    # Build cast expressions that handle multiple date formats for string columns
+    # Build cast expressions that handle the database's date format (MM/DD/YYYY)
     cast_expressions = []
     for col in sort_columns:
-        # Try multiple approaches: direct cast, then common string date formats
-        # coalesce picks the first non-null result
+        # Try direct cast first (works if already Date type), then parse as MM/DD/YYYY string
         expr = polars.coalesce(
-            # Try direct cast (works if already Date type or ISO format string)
             polars.col(col).cast(polars.Date, strict=False),
-            # Try common string date formats
-            polars.col(col).str.to_date("%Y-%m-%d", strict=False),      # ISO: 2020-11-10
-            polars.col(col).str.to_date("%m/%d/%Y", strict=False),      # US: 11/10/2020
-            polars.col(col).str.to_date("%d/%m/%Y", strict=False),      # EU: 10/11/2020
-            polars.col(col).str.to_date("%Y/%m/%d", strict=False),      # Alt: 2020/11/10
-            polars.col(col).str.to_date("%m-%d-%Y", strict=False),      # US dash: 11-10-2020
-            polars.col(col).str.to_date("%d-%m-%Y", strict=False),      # EU dash: 10-11-2020
+            polars.col(col).str.to_date("%m/%d/%Y", strict=False),
         ).alias(f"_sort_{col}")
         cast_expressions.append(expr)
 
@@ -162,12 +154,7 @@ def sort_dates(
             for col in dedupe_sort_cols:
                 expr = polars.coalesce(
                     polars.col(col).cast(polars.Date, strict=False),
-                    polars.col(col).str.to_date("%Y-%m-%d", strict=False),
                     polars.col(col).str.to_date("%m/%d/%Y", strict=False),
-                    polars.col(col).str.to_date("%d/%m/%Y", strict=False),
-                    polars.col(col).str.to_date("%Y/%m/%d", strict=False),
-                    polars.col(col).str.to_date("%m-%d-%Y", strict=False),
-                    polars.col(col).str.to_date("%d-%m-%Y", strict=False),
                 ).alias(f"_sort_{col}")
                 dedupe_cast_exprs.append(expr)
 
