@@ -89,7 +89,7 @@ def sort_dates(
 
         # Assign new indices: sorted valid rows get the original valid positions in order
         sorted_valid = sorted_valid.with_columns(
-            polars.Series("_new_idx", valid_original_positions)
+            polars.Series("_new_idx", valid_original_positions, dtype=polars.UInt32)
         )
     else:
         sorted_valid = valid_rows.with_columns(
@@ -178,7 +178,7 @@ def sort_dates(
                 valid_positions = valid_dedupe["_orig_idx"].to_list()
                 sorted_dedupe = valid_dedupe.sort(by=temp_sort_cols)
                 sorted_dedupe = sorted_dedupe.with_columns(
-                    polars.Series("_new_idx", valid_positions)
+                    polars.Series("_new_idx", valid_positions, dtype=polars.UInt32)
                 )
             else:
                 sorted_dedupe = valid_dedupe.with_columns(
