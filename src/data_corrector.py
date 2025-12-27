@@ -11,6 +11,7 @@ from multiprocessing import Pool
 
 from src.input_handlers.csv_reader import read_csv_files_to_polars
 from src.modules.errors.sanity_check.sanity_check import (
+    sort_dates,
     fill_negatives_fundamentals,
     fill_negatives_market,
     zero_wipeout,
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 dataframe_dict = read_csv_files_to_polars(data_directory, max_files= 500)
 
+date_cols = [
+        "f_filing_date",
+        "m_date",
+    ]
 
 fundamental_negatives_columns = [
     "fbs_cash_and_cash_equivalents",
@@ -91,12 +96,19 @@ ohlc_integrity_columns = [
 #     )
 #
 #
+# dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
+#         data_dict = dataframe_dict,
+#         columns = market_negatives_columns,
+#         function = fill_negatives_market,
+#     )
+#
 dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
         data_dict = dataframe_dict,
-        columns = market_negatives_columns,
-        function = fill_negatives_market,
+        columns = date_cols,
+        function = sort_dates,
     )
-
+#
+#
 #
 # dataframe_dict_clean_zero_wipeout, logs = parallel_process_tickers(
 #         data_dict = dataframe_dict,

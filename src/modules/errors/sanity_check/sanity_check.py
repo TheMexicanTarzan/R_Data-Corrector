@@ -1,8 +1,127 @@
 import polars
 import numpy
-from typing import Union
+from typing import Union, Literal
 import logging
 from scipy.interpolate import CubicSpline
+
+from typing import Literal, Union
+import polars
+
+
+def sort_dates(
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        ticker: str,
+        columns: list[str],
+        date_col: str = "m_date",
+        dedupe_strategy: Literal["earliest", "latest", "all"] = "all",
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
+    """
+    Sort a polars DataFrame or LazyFrame by date columns with a defined hierarchy.
+
+    Sorting hierarchy (highest to lowest priority):
+    1. f_filing_date
+    2. f_accepted_date
+    3. date_col (default: m_date)
+
+    Args:
+        df: The polars DataFrame or LazyFrame to sort.
+        ticker: The ticker symbol for logging/tracking purposes.
+        columns: List of column names present in the dataframe.
+        date_col: The fallback date column name (default: 'm_date').
+        dedupe_strategy: How to handle duplicate entries in date_col.
+            - "earliest": Keep entry with earliest f_filing_date.
+            - "latest": Keep entry with latest f_filing_date.
+            - "all": Keep all duplicate entries.
+
+    Returns:
+        A tuple containing:
+            - The sorted DataFrame or LazyFrame
+            - A list of dicts documenting order mismatches and removed duplicates
+    """
+    date_hierarchy = [
+        "f_filing_date",
+        "f_accepted_date",
+        date_col,
+    ]
+
+    sort_columns = [col for col in date_hierarchy if col in columns]
+    logs = []
+
+    if not sort_columns:
+        logs.append(
+            {
+                "ticker": ticker,
+                "error_type": "no_date_columns",
+                "message": "No date columns found for sorting",
+            }
+        )
+        return df, logs
+
+    is_lazy = isinstance(df, polars.LazyFrame)
+
+    df_with_idx = (
+        df.lazy()
+        .with_row_index("_original_idx")
+        .sort(by=sort_columns)
+        .with_row_index("_sorted_idx")
+    )
+
+    mismatches = (
+        df_with_idx
+        .filter(polars.col("_original_idx") != polars.col("_sorted_idx"))
+        .select(["_original_idx", "_sorted_idx"] + sort_columns)
+        .collect()
+    )
+
+    if mismatches.height > 0:
+        mismatch_dicts = mismatches.to_dicts()
+        for row in mismatch_dicts:
+            row["ticker"] = ticker
+            row["error_type"] = "order_mismatch"
+            row["original_position"] = row.pop("_original_idx")
+            row["sorted_position"] = row.pop("_sorted_idx")
+        logs.extend(mismatch_dicts)
+
+    result_df = df_with_idx.select(
+        polars.all().exclude(["_original_idx", "_sorted_idx"])
+    )
+
+    if dedupe_strategy != "all" and date_col in columns:
+        declaration_col = "f_filing_date"
+        if declaration_col in columns:
+            pre_dedupe = result_df.select(polars.len()).collect().item()
+
+            if dedupe_strategy == "earliest":
+                result_df = (
+                    result_df
+                    .sort(by=[date_col, declaration_col])
+                    .unique(subset=[date_col], keep="first", maintain_order=True)
+                )
+            elif dedupe_strategy == "latest":
+                result_df = (
+                    result_df
+                    .sort(by=[date_col, declaration_col], descending=[False, True])
+                    .unique(subset=[date_col], keep="first", maintain_order=True)
+                )
+
+            result_df = result_df.sort(by=sort_columns)
+
+            post_dedupe = result_df.select(polars.len()).collect().item()
+            removed_count = pre_dedupe - post_dedupe
+            if removed_count > 0:
+                logs.append(
+                    {
+                        "ticker": ticker,
+                        "error_type": "duplicates_removed",
+                        "strategy": dedupe_strategy,
+                        "duplicates_removed": removed_count,
+                    }
+                )
+
+    if not is_lazy:
+        result_df = result_df.collect()
+
+    return result_df, logs
 
 
 def fill_negatives_fundamentals(
@@ -67,12 +186,6 @@ def fill_negatives_fundamentals(
     )
 
     return cleaned_df, audit_log
-
-
-import polars
-import numpy
-from typing import Union
-from scipy.interpolate import CubicSpline
 
 
 def fill_negatives_market(
@@ -659,3 +772,5 @@ def ohlc_integrity(
     corrected_lf = working_lf.with_columns(correction_exprs)
 
     return (corrected_lf, resolutions)
+
+
