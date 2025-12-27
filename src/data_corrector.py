@@ -76,6 +76,14 @@ shares_outstanding_10x_columns = [
     "c_market_cap"
 ]
 
+ohlc_integrity_columns = [
+    "m_open",
+    "m_high",
+    "m_low",
+    "m_close",
+    "m_vwap"
+]
+
 # dataframe_dict_clean_negatives_fundamentals, negative_fundamentals_logs = parallel_process_tickers(
 #         data_dict = dataframe_dict,
 #         columns = fundamental_negatives_columns,
@@ -83,22 +91,31 @@ shares_outstanding_10x_columns = [
 #     )
 #
 #
+dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = market_negatives_columns,
+        function = fill_negatives_market,
+    )
+
+#
 # dataframe_dict_clean_zero_wipeout, logs = parallel_process_tickers(
 #         data_dict = dataframe_dict,
 #         columns = zero_wipeout_columns,
 #         function = zero_wipeout
 #     )
-
+#
+#
 # dataframe_dict_clean_10x_shares_outstanding, logs = parallel_process_tickers(
 #         data_dict = dataframe_dict,
 #         columns = shares_outstanding_10x_columns,
 #         function = mkt_cap_scale_error
 #     )
 
-dataframe_dict_clean_zero_wipeout, logs = parallel_process_tickers(
-        data_dict = dataframe_dict,
-        columns = market_negatives_columns,
-        function = fill_negatives_market,
-    )
 
-print(dataframe_dict_clean_zero_wipeout)
+# dataframe_dict_clean_ohlc_integrity, logs = parallel_process_tickers(
+#         data_dict = dataframe_dict,
+#         function = ohlc_integrity
+#     )
+
+print("done")
+

@@ -44,10 +44,7 @@ def fill_negatives_fundamentals(
         problem_query = df.filter(polars.col(col) < 0).select([date_col, col])
 
         # Collect only the problem rows (not the entire dataset)
-        if is_lazy:
-            problem_rows = problem_query.collect()
-        else:
-            problem_rows = problem_query
+        problem_rows = problem_query.collect()
 
         # Check if there are any problem rows
         if len(problem_rows) > 0:
@@ -70,6 +67,120 @@ def fill_negatives_fundamentals(
     )
 
     return cleaned_df, audit_log
+
+
+import polars
+import numpy
+from typing import Union
+from scipy.interpolate import CubicSpline
+
+
+def fill_negatives_market(
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        ticker: str,
+        columns: list[str],
+        date_col: str = 'm_date'
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
+    """
+    Detect and correct negative values in market data using backward-looking cubic spline.
+
+    Uses only previous data points to avoid look-forward bias, making it suitable
+    for backtesting applications.
+
+    Args:
+        df: Input DataFrame or LazyFrame containing market data
+        ticker: Ticker symbol for logging/tracking purposes
+        columns: List of column names to check and correct for negative values
+        date_col: Name of the date column (default: 'm_date')
+
+    Returns:
+        tuple containing:
+            - Corrected DataFrame/LazyFrame (same type as input)
+            - List of dictionaries documenting each correction made
+    """
+    is_lazy = isinstance(df, polars.LazyFrame)
+    if is_lazy:
+        working_df = df.collect()
+    else:
+        working_df = df.clone()
+
+    working_df = working_df.sort(date_col)
+
+    corrections = []
+
+    for col in columns:
+        if col not in working_df.columns:
+            continue
+
+        values = working_df[col].to_numpy().astype(numpy.float64)
+        dates = working_df[date_col].to_list()
+
+        # Track original null positions to preserve them
+        null_mask = ~numpy.isfinite(values)
+
+        # Find negatives: must be finite AND less than zero
+        negative_mask = numpy.isfinite(values) & (values < 0)
+        negative_indices = numpy.where(negative_mask)[0]
+
+        if len(negative_indices) == 0:
+            continue
+
+        for idx in negative_indices:
+            original_value = float(values[idx])
+
+            prev_valid_indices = []
+            prev_valid_values = []
+            for i in range(idx - 1, -1, -1):
+                if values[i] >= 0 and numpy.isfinite(values[i]):
+                    prev_valid_indices.append(i)
+                    prev_valid_values.append(values[i])
+                if len(prev_valid_indices) >= 4:
+                    break
+
+            if len(prev_valid_indices) == 0:
+                continue
+
+            if len(prev_valid_indices) < 3:
+                corrected_value = prev_valid_values[0]
+                method = 'last_valid_value'
+            else:
+                prev_valid_indices = prev_valid_indices[::-1]
+                prev_valid_values = prev_valid_values[::-1]
+
+                spline = CubicSpline(
+                    prev_valid_indices,
+                    prev_valid_values,
+                    extrapolate=True
+                )
+                corrected_value = float(spline(idx))
+                method = 'cubic_spline_backward'
+
+                if corrected_value < 0 or not numpy.isfinite(corrected_value):
+                    corrected_value = prev_valid_values[-1]
+                    method = 'last_valid_value_fallback'
+
+            values[idx] = corrected_value
+
+            corrections.append({
+                'ticker': ticker,
+                'column': col,
+                'date': dates[idx],
+                'original_value': original_value,
+                'corrected_value': corrected_value,
+                'method': method
+            })
+
+        # Restore original null positions
+        values[null_mask] = numpy.nan
+
+        working_df = working_df.with_columns(
+            polars.Series(name=col, values=values)
+        )
+
+    if is_lazy:
+        return working_df.lazy(), corrections
+    else:
+        return working_df, corrections
 
 
 def zero_wipeout(
@@ -286,474 +397,257 @@ def mkt_cap_scale_error(
 
 
 def ohlc_integrity(
-        df: Union[polars.DataFrame, polars.LazyFrame],
-        ticker: str,
-        columns: list[str] = [""],
-        date_col: str = 'm_date'
+    df: Union[polars.DataFrame, polars.LazyFrame],
+    ticker: str,
+    columns: list[str] = [""],  # for backward compatibility, useless but do not eliminate
+    date_col: str = "m_date",
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
-    Ensures OHLC integrity for standard, split-adjusted, and dividend-adjusted columns.
-    Works with both DataFrame (eager) and LazyFrame (lazy) execution.
+    Validate and resolve OHLC data integrity issues:
+    - High must be >= max(Open, Close, Low) -> resolved by setting High = max
+    - Low must be <= min(Open, Close, High) -> resolved by setting Low = min
+    - VWAP must be within [Low, High] -> resolved by setting VWAP = (O+H+L+C)/4
 
-    Logic:
-      - Sets 'low' = min(open, high, low, close, vwap)
-      - Sets 'high' = max(open, high, low, close, vwap)
-
-    Groups processed:
-      1. Standard: m_open, m_high, m_low, m_close
-      2. Split Adj: m_open_split_adjusted, ...
-      3. Div & Split Adj: m_open_dividend_and_split_adjusted, ...
+    Checks are performed on three column groups:
+    - Raw OHLC
+    - Split adjusted OHLC
+    - Dividend and split adjusted OHLC
 
     Args:
-        df: Input polars DataFrame or LazyFrame.
-        ticker: Stock ticker symbol for logging.
-        columns: (unused in current implementation)
-        date_col: Name of the date column for audit log.
+        df: Polars DataFrame or LazyFrame containing OHLC data
+        ticker: Ticker symbol for error reporting
+        columns: Unused, kept for backward compatibility
+        date_col: Name of the date column
 
     Returns:
-        Tuple of (cleaned DataFrame/LazyFrame, audit_log list)
-
-    Note:
-        Assumes all OHLC columns are already correctly typed as Float64 via schema enforcement.
+        Tuple of (corrected dataframe/lazyframe, list of resolution dictionaries)
     """
     is_lazy = isinstance(df, polars.LazyFrame)
+    working_lf = df if is_lazy else df.lazy()
 
-    # Define the column groups explicitly based on the subset provided
-    groups = [
-        # Group 1: Standard
+    # Get schema to check column existence without collecting
+    schema_cols = set(working_lf.collect_schema().names())
+
+    # Define column groups to validate
+    column_groups = [
         {
-            "name": "standard",
+            "name": "raw",
             "open": "m_open",
             "high": "m_high",
             "low": "m_low",
             "close": "m_close",
-            "vwap": "m_vwap"
+            "vwap": "m_vwap",
         },
-        # Group 2: Split Adjusted
         {
             "name": "split_adjusted",
             "open": "m_open_split_adjusted",
             "high": "m_high_split_adjusted",
             "low": "m_low_split_adjusted",
             "close": "m_close_split_adjusted",
-            "vwap": "m_vwap_split_adjusted"
+            "vwap": "m_vwap_split_adjusted",
         },
-        # Group 3: Dividend and Split Adjusted
         {
             "name": "dividend_and_split_adjusted",
             "open": "m_open_dividend_and_split_adjusted",
             "high": "m_high_dividend_and_split_adjusted",
             "low": "m_low_dividend_and_split_adjusted",
             "close": "m_close_dividend_and_split_adjusted",
-            "vwap": "m_vwap_dividend_and_split_adjusted"
-        }
+            "vwap": "m_vwap_dividend_and_split_adjusted",
+        },
     ]
 
-    # ============================================================================
-    # Step 1: Detect violations and build audit log
-    # ============================================================================
-    audit_expressions = []
+    # Build expressions
+    violation_exprs = []
+    correction_exprs = []
+    violation_info = []
+    columns_for_logging = {date_col}
 
-    for g in groups:
-        ohlc_cols = [g["open"], g["high"], g["low"], g["close"], g["vwap"]]
+    for group in column_groups:
+        group_name = group["name"]
+        open_col = group["open"]
+        high_col = group["high"]
+        low_col = group["low"]
+        close_col = group["close"]
+        vwap_col = group["vwap"]
 
-        # Filter to only columns that exist
-        existing_ohlc_cols = [col for col in ohlc_cols if col in df.columns]
+        # Check if required OHLC columns exist
+        required_cols = [open_col, high_col, low_col, close_col]
+        if not all(col in schema_cols for col in required_cols):
+            continue
 
-        if len(existing_ohlc_cols) >= 2:  # Need at least 2 columns for min/max
-            # Calculate correct values
-            audit_expressions.extend([
-                polars.min_horizontal(existing_ohlc_cols).alias(f"_correct_low_{g['name']}"),
-                polars.max_horizontal(existing_ohlc_cols).alias(f"_correct_high_{g['name']}")
-            ])
+        has_vwap = vwap_col in schema_cols
 
-    # Add these temporary columns for comparison
-    df_with_audit = df.with_columns(audit_expressions)
+        # Track columns needed for logging
+        columns_for_logging.update(required_cols)
+        if has_vwap:
+            columns_for_logging.add(vwap_col)
 
-    # Build violation detection expressions
-    violation_conditions = []
+        # Precompute expressions (Polars will optimize common subexpressions)
+        ohlc_max = polars.max_horizontal(
+            polars.col(open_col),
+            polars.col(high_col),
+            polars.col(low_col),
+            polars.col(close_col),
+        )
+        ohlc_min = polars.min_horizontal(
+            polars.col(open_col),
+            polars.col(high_col),
+            polars.col(low_col),
+            polars.col(close_col),
+        )
 
-    for g in groups:
-        # Check if low or high need correction
-        if g["low"] in df_with_audit.columns and f"_correct_low_{g['name']}" in df_with_audit.columns:
-            low_violation = (
-                    polars.col(g["low"]).is_not_null() &
-                    (polars.col(g["low"]) != polars.col(f"_correct_low_{g['name']}"))
+        # Check 1: High >= max(Open, Close, Low)
+        high_viol_name = f"_viol_{group_name}_high"
+        high_viol_expr = polars.col(high_col) < ohlc_max
+        violation_exprs.append(high_viol_expr.alias(high_viol_name))
+        correction_exprs.append(
+            polars.when(high_viol_expr)
+            .then(ohlc_max)
+            .otherwise(polars.col(high_col))
+            .alias(high_col)
+        )
+        violation_info.append(
+            {
+                "col": high_viol_name,
+                "error_type": "high_not_maximum",
+                "group_name": group_name,
+                "group": group,
+                "has_vwap": has_vwap,
+            }
+        )
+
+        # Check 2: Low <= min(Open, Close, High)
+        low_viol_name = f"_viol_{group_name}_low"
+        low_viol_expr = polars.col(low_col) > ohlc_min
+        violation_exprs.append(low_viol_expr.alias(low_viol_name))
+        correction_exprs.append(
+            polars.when(low_viol_expr)
+            .then(ohlc_min)
+            .otherwise(polars.col(low_col))
+            .alias(low_col)
+        )
+        violation_info.append(
+            {
+                "col": low_viol_name,
+                "error_type": "low_not_minimum",
+                "group_name": group_name,
+                "group": group,
+                "has_vwap": has_vwap,
+            }
+        )
+
+        # Check 3: VWAP within [Low, High]
+        if has_vwap:
+            ohlc_centroid = (
+                polars.col(open_col)
+                + polars.col(high_col)
+                + polars.col(low_col)
+                + polars.col(close_col)
+            ) / 4.0
+
+            vwap_viol_name = f"_viol_{group_name}_vwap"
+            vwap_viol_expr = (polars.col(vwap_col) < polars.col(low_col)) | (
+                polars.col(vwap_col) > polars.col(high_col)
             )
-        else:
-            low_violation = polars.lit(False)
-
-        if g["high"] in df_with_audit.columns and f"_correct_high_{g['name']}" in df_with_audit.columns:
-            high_violation = (
-                    polars.col(g["high"]).is_not_null() &
-                    (polars.col(g["high"]) != polars.col(f"_correct_high_{g['name']}"))
+            violation_exprs.append(vwap_viol_expr.alias(vwap_viol_name))
+            correction_exprs.append(
+                polars.when(vwap_viol_expr)
+                .then(ohlc_centroid)
+                .otherwise(polars.col(vwap_col))
+                .alias(vwap_col)
             )
-        else:
-            high_violation = polars.lit(False)
-
-        group_violation = low_violation | high_violation
-        violation_conditions.append(group_violation)
-
-    # Combine all violation conditions
-    if violation_conditions:
-        any_violation = violation_conditions[0]
-        for cond in violation_conditions[1:]:
-            any_violation = any_violation | cond
-    else:
-        any_violation = polars.lit(False)
-
-    # Extract rows with violations
-    select_cols = [date_col] if date_col in df_with_audit.columns else []
-
-    for g in groups:
-        group_cols = [
-            g["open"], g["high"], g["low"], g["close"],
-            f"_correct_low_{g['name']}", f"_correct_high_{g['name']}"
-        ]
-        select_cols.extend([col for col in group_cols if col in df_with_audit.columns])
-
-    # Only proceed if we have columns to select
-    if len(select_cols) > 0:
-        problem_query = df_with_audit.filter(any_violation).select(select_cols)
-
-        if is_lazy:
-            problem_rows = problem_query.collect()
-        else:
-            problem_rows = problem_query
-
-        # Build audit log
-        audit_log = []
-        if len(problem_rows) > 0:
-            for row in problem_rows.iter_rows(named=True):
-                date = row.get(date_col)
-
-                for g in groups:
-                    low_col = g["low"]
-                    high_col = g["high"]
-                    correct_low_col = f"_correct_low_{g['name']}"
-                    correct_high_col = f"_correct_high_{g['name']}"
-
-                    violations = []
-
-                    # Check low violation
-                    if (low_col in row and correct_low_col in row and
-                            row[low_col] is not None and row[correct_low_col] is not None and
-                            row[low_col] != row[correct_low_col]):
-                        violations.append({
-                            'column': low_col,
-                            'original_value': row[low_col],
-                            'corrected_value': row[correct_low_col],
-                            'violation_type': 'low_too_high'
-                        })
-
-                    # Check high violation
-                    if (high_col in row and correct_high_col in row and
-                            row[high_col] is not None and row[correct_high_col] is not None and
-                            row[high_col] != row[correct_high_col]):
-                        violations.append({
-                            'column': high_col,
-                            'original_value': row[high_col],
-                            'corrected_value': row[correct_high_col],
-                            'violation_type': 'high_too_low'
-                        })
-
-                    # Add to audit log
-                    for v in violations:
-                        audit_log.append({
-                            'ticker': ticker,
-                            date_col: date,
-                            'error_type': 'ohlc_integrity_violation',
-                            'group': g['name'],
-                            'column': v['column'],
-                            'original_value': v['original_value'],
-                            'corrected_value': v['corrected_value'],
-                            'violation_type': v['violation_type']
-                        })
-
-            logging.info(f"Found {len(audit_log)} OHLC integrity violations for ticker {ticker}")
-        else:
-            audit_log = []
-    else:
-        audit_log = []
-
-    # ============================================================================
-    # Step 2: Apply corrections
-    # ============================================================================
-    correction_expressions = []
-
-    for g in groups:
-        ohlc_cols = [g["open"], g["high"], g["low"], g["close"], g["vwap"]]
-
-        # Filter to only existing columns
-        existing_ohlc_cols = [col for col in ohlc_cols if col in df.columns]
-
-        if len(existing_ohlc_cols) >= 2:
-            # Create expression to overwrite the 'low' column
-            if g["low"] in df.columns:
-                correction_expressions.append(
-                    polars.min_horizontal(existing_ohlc_cols).alias(g["low"])
-                )
-
-            # Create expression to overwrite the 'high' column
-            if g["high"] in df.columns:
-                correction_expressions.append(
-                    polars.max_horizontal(existing_ohlc_cols).alias(g["high"])
-                )
-
-    # Apply all corrections at once
-    if correction_expressions:
-        df_corrected = df.with_columns(correction_expressions)
-    else:
-        df_corrected = df
-
-    return df_corrected, audit_log
-
-
-def fill_negatives_market(
-        df: Union[polars.DataFrame, polars.LazyFrame],
-        ticker: str,
-        columns: list[str],
-        date_col: str = 'm_date'
-) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
-    """
-    Detects negative values in specified columns and imputes them using cubic spline
-    interpolation based ONLY on previous valid data (no forward-looking bias).
-
-    This implements the temporal imputation methodology from Section 5.1 of the
-    Financial Data Error Detection Framework: "Spline Interpolation: For missing
-    m_close prices, a cubic spline fits a smooth curve through the data points.
-    Unlike linear interpolation, which creates artificial kinks, splines preserve
-    the smoothness of the price path."
-
-    Works with both DataFrame (eager) and LazyFrame (lazy) execution.
-
-    Logic:
-      1. Sort by date to ensure temporal ordering
-      2. For each column, identify negative values
-      3. For each negative value:
-         - Collect all PREVIOUS valid (non-negative) data points
-         - If ≥3 previous points: Use cubic spline interpolation
-         - If 2 previous points: Use linear interpolation
-         - If 1 previous point: Use last observation carried forward (LOCF)
-         - If 0 previous points: Use next valid observation carried backward (NOCB)
-      4. Log all corrections in audit trail
-
-    Constraint Violations Detected:
-      - Negative prices (violates Constraint 2 from Section 2.1.1:
-        "Prices cannot be negative in equity markets")
-      - Negative volumes (impossible in market microstructure)
-      - Negative fundamental values where sign convention expects positive
-
-    Args:
-        df: Input polars DataFrame or LazyFrame.
-        ticker: Stock ticker symbol for logging.
-        columns: List of column names to check for negative values.
-                 Example: ['m_open', 'm_close', 'm_volume', 'fbs_assets']
-        date_col: Name of the date column for temporal ordering.
-
-    Returns:
-        Tuple of (cleaned DataFrame/LazyFrame, audit_log list)
-
-    Raises:
-        ValueError: If date_col not in dataframe or if columns list is empty.
-
-    Note:
-        Assumes columns are already correctly typed as Float64 via schema enforcement.
-    """
-
-    # ============================================================================
-    # Input Validation
-    # ============================================================================
-    if not columns or len(columns) == 0:
-        raise ValueError("columns parameter cannot be empty")
-
-    is_lazy = isinstance(df, polars.LazyFrame)
-
-    # For lazy frames, collect first to work with actual data
-    # This is necessary because we need to access data for spline interpolation
-    if is_lazy:
-        df_working = df.collect()
-        was_lazy = True
-    else:
-        df_working = df
-        was_lazy = False
-
-    if date_col not in df_working.columns:
-        raise ValueError(f"date_col '{date_col}' not found in dataframe columns")
-
-    # Filter columns to only those that exist in the dataframe
-    existing_columns = [col for col in columns if col in df_working.columns]
-
-    if len(existing_columns) == 0:
-        logging.warning(f"None of the specified columns exist in dataframe for ticker {ticker}")
-        return (df.lazy() if was_lazy else df), []
-
-    # ============================================================================
-    # Step 1: Sort by Date (CRITICAL for forward-looking bias prevention)
-    # ============================================================================
-    df_working = df_working.sort(date_col)
-
-    # ============================================================================
-    # Step 2: Detect Negative Values and Build Audit Log
-    # ============================================================================
-    audit_log = []
-    correction_map = {}  # Store corrections: {(row_idx, col): corrected_value}
-
-    # Convert to pandas for easier row-wise operations (polars doesn't have good row indexing)
-    df_pandas = df_working.to_pandas()
-
-    for col in existing_columns:
-        # Find indices where values are negative
-        negative_mask = df_pandas[col] < 0
-        negative_indices = df_pandas[negative_mask].index.tolist()
-
-        if len(negative_indices) == 0:
-            continue  # No negative values in this column
-
-        logging.info(f"Found {len(negative_indices)} negative values in column '{col}' for ticker {ticker}")
-
-        # ========================================================================
-        # Step 3: Impute Each Negative Value Using Backward-Looking Spline
-        # ========================================================================
-        for neg_idx in negative_indices:
-            original_value = df_pandas.loc[neg_idx, col]
-            date_value = df_pandas.loc[neg_idx, date_col]
-
-            # Collect ALL PREVIOUS valid (non-negative, non-null) data points
-            previous_mask = (
-                    (df_pandas.index < neg_idx) &  # Only previous rows
-                    (df_pandas[col] >= 0) &  # Non-negative
-                    (df_pandas[col].notna())  # Non-null
+            violation_info.append(
+                {
+                    "col": vwap_viol_name,
+                    "error_type": "vwap_outside_range",
+                    "group_name": group_name,
+                    "group": group,
+                    "has_vwap": has_vwap,
+                }
             )
-            previous_data = df_pandas[previous_mask]
 
-            corrected_value = None
-            imputation_method = None
+    # If no checks possible, return early
+    if not violation_exprs:
+        return (df, [])
 
-            # Choose imputation method based on available previous data
-            if len(previous_data) >= 3:
-                # ================================================================
-                # Method 1: Cubic Spline Interpolation (Preferred)
-                # ================================================================
-                # Extract previous dates and values
-                prev_indices = previous_data.index.tolist()
-                prev_values = previous_data[col].values
+    # Build logging query: select only needed columns, add flags, filter violations
+    violation_col_names = [info["col"] for info in violation_info]
+    any_violation = polars.any_horizontal(*[polars.col(c) for c in violation_col_names])
 
-                # Create numeric x-axis (use index positions for interpolation)
-                x_prev = numpy.array(prev_indices)
-                y_prev = numpy.array(prev_values)
+    error_rows_df = (
+        working_lf
+        .select(list(columns_for_logging))
+        .with_columns(violation_exprs)
+        .filter(any_violation)
+        .collect()
+    )
 
-                try:
-                    # Fit cubic spline through previous valid points
-                    # bc_type='natural' ensures smooth second derivative at boundaries
-                    cs = CubicSpline(x_prev, y_prev, bc_type='natural')
+    # Build resolution logs
+    resolutions = []
+    if not error_rows_df.is_empty():
+        error_rows = error_rows_df.to_dicts()
 
-                    # Interpolate at the negative value's position
-                    corrected_value = float(cs(neg_idx))
+        for row in error_rows:
+            for info in violation_info:
+                if not row.get(info["col"]):
+                    continue
 
-                    # Ensure corrected value is non-negative (spline can overshoot)
-                    if corrected_value < 0:
-                        corrected_value = float(y_prev[-1])  # Fall back to LOCF
-                        imputation_method = 'cubic_spline_with_locf_fallback'
-                    else:
-                        imputation_method = 'cubic_spline'
+                group = info["group"]
+                group_name = info["group_name"]
+                error_type = info["error_type"]
+                has_vwap = info["has_vwap"]
 
-                except Exception as e:
-                    # Spline fitting can fail with collinear points
-                    logging.warning(f"Cubic spline failed for {ticker} col={col} idx={neg_idx}: {e}")
-                    corrected_value = float(previous_data[col].iloc[-1])
-                    imputation_method = 'locf_after_spline_failure'
+                open_col = group["open"]
+                high_col = group["high"]
+                low_col = group["low"]
+                close_col = group["close"]
+                vwap_col = group["vwap"]
 
-            elif len(previous_data) == 2:
-                # ================================================================
-                # Method 2: Linear Interpolation
-                # ================================================================
-                prev_indices = previous_data.index.tolist()
-                prev_values = previous_data[col].values
+                open_val = row.get(open_col)
+                high_val = row.get(high_col)
+                low_val = row.get(low_col)
+                close_val = row.get(close_col)
+                vwap_val = row.get(vwap_col) if has_vwap else None
 
-                # Linear extrapolation from last two points
-                x1, x2 = prev_indices[-2], prev_indices[-1]
-                y1, y2 = prev_values[-2], prev_values[-1]
+                ohlc_vals = [open_val, high_val, low_val, close_val]
+                ohlc_max_val = max(ohlc_vals)
+                ohlc_min_val = min(ohlc_vals)
 
-                # Linear equation: y = y1 + (y2-y1)/(x2-x1) * (x-x1)
-                slope = (y2 - y1) / (x2 - x1)
-                corrected_value = float(y1 + slope * (neg_idx - x1))
+                resolution_entry = {
+                    "ticker": ticker,
+                    "date": row.get(date_col),
+                    "error_type": error_type,
+                    "column_group": group_name,
+                    "open": open_val,
+                    "high": high_val,
+                    "low": low_val,
+                    "close": close_val,
+                    "vwap": vwap_val,
+                }
 
-                # Ensure non-negative
-                if corrected_value < 0:
-                    corrected_value = float(y2)  # Use last observation
-                    imputation_method = 'linear_with_locf_fallback'
-                else:
-                    imputation_method = 'linear_interpolation'
+                if error_type == "high_not_maximum":
+                    resolution_entry["old_high"] = high_val
+                    resolution_entry["new_high"] = ohlc_max_val
+                    resolution_entry["message"] = (
+                        f"High corrected from {high_val} to {ohlc_max_val}"
+                    )
+                elif error_type == "low_not_minimum":
+                    resolution_entry["old_low"] = low_val
+                    resolution_entry["new_low"] = ohlc_min_val
+                    resolution_entry["message"] = (
+                        f"Low corrected from {low_val} to {ohlc_min_val}"
+                    )
+                elif error_type == "vwap_outside_range":
+                    ohlc_centroid_val = sum(ohlc_vals) / 4.0
+                    resolution_entry["old_vwap"] = vwap_val
+                    resolution_entry["new_vwap"] = ohlc_centroid_val
+                    resolution_entry["message"] = (
+                        f"VWAP corrected from {vwap_val} to {ohlc_centroid_val} (OHLC centroid)"
+                    )
 
-            elif len(previous_data) == 1:
-                # ================================================================
-                # Method 3: Last Observation Carried Forward (LOCF)
-                # ================================================================
-                corrected_value = float(previous_data[col].iloc[-1])
-                imputation_method = 'locf'
+                resolutions.append(resolution_entry)
 
-            else:
-                # ================================================================
-                # Method 4: Next Observation Carried Backward (NOCB)
-                # ================================================================
-                # No previous valid data - must look forward (unavoidable)
-                next_mask = (
-                        (df_pandas.index > neg_idx) &
-                        (df_pandas[col] >= 0) &
-                        (df_pandas[col].notna())
-                )
-                next_data = df_pandas[next_mask]
+    # Apply corrections (separate query, no violation flags in output)
+    corrected_lf = working_lf.with_columns(correction_exprs)
 
-                if len(next_data) > 0:
-                    corrected_value = float(next_data[col].iloc[0])
-                    imputation_method = 'nocb_no_previous_data'
-                else:
-                    # No valid data at all - use 0 or column median
-                    valid_mask = (df_pandas[col] >= 0) & (df_pandas[col].notna())
-                    if valid_mask.any():
-                        corrected_value = float(df_pandas.loc[valid_mask, col].median())
-                        imputation_method = 'column_median_fallback'
-                    else:
-                        corrected_value = 0.0
-                        imputation_method = 'zero_fallback_no_valid_data'
-
-            # Store correction
-            correction_map[(neg_idx, col)] = corrected_value
-
-            # Add to audit log
-            audit_log.append({
-                'ticker': ticker,
-                date_col: date_value,
-                'row_index': int(neg_idx),
-                'error_type': 'negative_value_violation',
-                'column': col,
-                'original_value': float(original_value),
-                'corrected_value': corrected_value,
-                'imputation_method': imputation_method,
-                'previous_valid_points': len(previous_data) if previous_data is not None else 0
-            })
-
-    # ============================================================================
-    # Step 4: Apply All Corrections
-    # ============================================================================
-    if len(correction_map) > 0:
-        # Apply corrections to pandas dataframe
-        for (row_idx, col), corrected_val in correction_map.items():
-            df_pandas.loc[row_idx, col] = corrected_val
-
-        # Convert back to polars
-        df_corrected = polars.from_pandas(df_pandas)
-
-        logging.info(f"Corrected {len(audit_log)} negative values for ticker {ticker}")
-    else:
-        df_corrected = df_working
-        logging.info(f"No negative values found for ticker {ticker}")
-
-    # ============================================================================
-    # Step 5: Return in Original Format (Lazy or Eager)
-    # ============================================================================
-    if was_lazy:
-        return df_corrected.lazy(), audit_log
-    else:
-        return df_corrected, audit_log
+    return (corrected_lf, resolutions)
