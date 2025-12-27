@@ -102,11 +102,11 @@ ohlc_integrity_columns = [
 #         function = fill_negatives_market,
 #     )
 #
-dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
-        data_dict = dataframe_dict,
-        columns = date_cols,
-        function = sort_dates,
-    )
+# dataframe_dict_sorted_dates, logs = parallel_process_tickers(
+#         data_dict = dataframe_dict,
+#         columns = date_cols,
+#         function = sort_dates,
+#     )
 #
 #
 #
@@ -128,6 +128,12 @@ dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
 #         data_dict = dataframe_dict,
 #         function = ohlc_integrity
 #     )
+
+dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = date_cols,
+        function = sort_dates,
+    )
 
 print("done")
 

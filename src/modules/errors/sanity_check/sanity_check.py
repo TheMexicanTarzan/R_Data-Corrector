@@ -4,9 +4,6 @@ from typing import Union, Literal
 import logging
 from scipy.interpolate import CubicSpline
 
-from typing import Literal, Union
-import polars
-
 
 def sort_dates(
         df: Union[polars.DataFrame, polars.LazyFrame],
@@ -863,5 +860,4 @@ def ohlc_integrity(
     corrected_lf = working_lf.with_columns(correction_exprs)
 
     return (corrected_lf, resolutions)
-
 
