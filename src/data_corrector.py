@@ -1,13 +1,6 @@
-import sys
-import os
-from pathlib import Path
-from typing import Callable
-import logging
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from tqdm import tqdm
 
-import polars
-from multiprocessing import Pool
+from pathlib import Path
+import logging
 
 from src.input_handlers.csv_reader import read_csv_files_to_polars
 from src.modules.errors.sanity_check.sanity_check import (
@@ -90,47 +83,47 @@ ohlc_integrity_columns = [
     "m_vwap"
 ]
 
-# dataframe_dict_clean_negatives_fundamentals, negative_fundamentals_logs = parallel_process_tickers(
-#         data_dict = dataframe_dict,
-#         columns = fundamental_negatives_columns,
-#         function = fill_negatives_fundamentals
-#     )
-#
-#
-# dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
-#         data_dict = dataframe_dict,
-#         columns = market_negatives_columns,
-#         function = fill_negatives_market,
-#     )
-#
-# dataframe_dict_sorted_dates, logs = parallel_process_tickers(
-#         data_dict = dataframe_dict,
-#         columns = date_cols,
-#         function = sort_dates,
-#     )
-#
-#
-#
-# dataframe_dict_clean_zero_wipeout, logs = parallel_process_tickers(
-#         data_dict = dataframe_dict,
-#         columns = zero_wipeout_columns,
-#         function = zero_wipeout
-#     )
-#
-#
-# dataframe_dict_clean_10x_shares_outstanding, logs = parallel_process_tickers(
-#         data_dict = dataframe_dict,
-#         columns = shares_outstanding_10x_columns,
-#         function = mkt_cap_scale_error
-#     )
+dataframe_dict_clean_negatives_fundamentals, negative_fundamentals_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = fundamental_negatives_columns,
+        function = fill_negatives_fundamentals
+    )
 
 
-# dataframe_dict_clean_ohlc_integrity, logs = parallel_process_tickers(
-#         data_dict = dataframe_dict,
-#         function = ohlc_integrity
-#     )
+dataframe_dict_clean_negatives_market, negative_market_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = market_negatives_columns,
+        function = fill_negatives_market,
+    )
 
-dataframe_dict_clean_financial_equivalencies, logs = parallel_process_tickers(
+dataframe_dict_sorted_dates, unsorted_dates_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = date_cols,
+        function = sort_dates,
+    )
+
+
+
+dataframe_dict_clean_zero_wipeout, zero_wipeout_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = zero_wipeout_columns,
+        function = zero_wipeout
+    )
+
+
+dataframe_dict_clean_10x_shares_outstanding, shares_outstanding_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = shares_outstanding_10x_columns,
+        function = mkt_cap_scale_error
+    )
+
+
+dataframe_dict_clean_ohlc_integrity, ohlc_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        function = ohlc_integrity
+    )
+
+dataframe_dict_clean_financial_equivalencies, financial_unequivalencies_logs = parallel_process_tickers(
         data_dict = dataframe_dict,
         columns = date_cols,
         function = validate_financial_equivalencies,
