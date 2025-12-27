@@ -71,7 +71,7 @@ def sort_dates(
         df.lazy()
         .with_columns(cast_expressions)
         .with_row_index("_original_idx")
-        .sort(by=temp_sort_cols, nulls_last=True)
+        .sort(by=temp_sort_cols)
         .with_row_index("_sorted_idx")
         .drop(temp_sort_cols)
     )
@@ -113,7 +113,7 @@ def sort_dates(
                 result_df = (
                     result_df
                     .with_columns(dedupe_cast_exprs)
-                    .sort(by=temp_dedupe_cols, nulls_last=True)
+                    .sort(by=temp_dedupe_cols)
                     .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
                 )
@@ -121,7 +121,7 @@ def sort_dates(
                 result_df = (
                     result_df
                     .with_columns(dedupe_cast_exprs)
-                    .sort(by=temp_dedupe_cols, descending=[False, True], nulls_last=True)
+                    .sort(by=temp_dedupe_cols, descending=[False, True])
                     .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
                 )
@@ -130,7 +130,7 @@ def sort_dates(
             result_df = (
                 result_df
                 .with_columns(cast_expressions)
-                .sort(by=temp_sort_cols, nulls_last=True)
+                .sort(by=temp_sort_cols)
                 .drop(temp_sort_cols)
             )
 
