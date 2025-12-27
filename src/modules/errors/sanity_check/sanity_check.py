@@ -61,24 +61,62 @@ def sort_dates(
 
     # Create temporary columns cast to Date type to ensure chronological sorting
     # This handles cases where dates might be stored as strings
+    primary_sort_col = sort_columns[0]
     temp_sort_cols = [f"_sort_{col}" for col in sort_columns]
     cast_expressions = [
         polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
         for col in sort_columns
     ]
 
+    # Add original index and cast date columns
     df_with_idx = (
         df.lazy()
-        .with_columns(cast_expressions)
         .with_row_index("_original_idx")
-        .sort(by=temp_sort_cols)
-        .with_row_index("_sorted_idx")
-        .drop(temp_sort_cols)
+        .with_columns(cast_expressions)
     )
 
+    # Identify rows with valid (non-null) primary sort column
+    # We only sort non-null rows; null rows stay in their original positions
+    valid_rows = df_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_not_null()).collect()
+    null_rows = df_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_null()).collect()
+
+    if valid_rows.height > 0:
+        # Get the original positions of valid rows (these are the slots we'll fill with sorted data)
+        valid_original_positions = valid_rows["_original_idx"].to_list()
+
+        # Sort valid rows by date columns
+        sorted_valid = valid_rows.sort(by=temp_sort_cols)
+
+        # Assign new indices: sorted valid rows get the original valid positions in order
+        sorted_valid = sorted_valid.with_columns(
+            polars.Series("_new_idx", valid_original_positions)
+        )
+    else:
+        sorted_valid = valid_rows.with_columns(
+            polars.col("_original_idx").alias("_new_idx")
+        )
+
+    # Null rows keep their original positions
+    null_rows = null_rows.with_columns(
+        polars.col("_original_idx").alias("_new_idx")
+    )
+
+    # Combine and sort by new index to restore proper order
+    combined = polars.concat([sorted_valid, null_rows])
+    df_with_idx = (
+        combined.lazy()
+        .sort("_new_idx")
+        .with_columns(polars.col("_new_idx").alias("_sorted_idx"))
+        .rename({"_new_idx": "_final_idx"})
+    )
+
+    # Detect mismatches (only for valid rows since null rows don't move)
     mismatches = (
         df_with_idx
-        .filter(polars.col("_original_idx") != polars.col("_sorted_idx"))
+        .filter(
+            (polars.col("_original_idx") != polars.col("_sorted_idx")) &
+            polars.col(f"_sort_{primary_sort_col}").is_not_null()
+        )
         .select(["_original_idx", "_sorted_idx"] + sort_columns)
         .collect()
     )
@@ -93,7 +131,7 @@ def sort_dates(
         logs.extend(mismatch_dicts)
 
     result_df = df_with_idx.select(
-        polars.all().exclude(["_original_idx", "_sorted_idx"])
+        polars.all().exclude(["_original_idx", "_sorted_idx", "_final_idx"] + temp_sort_cols)
     )
 
     if dedupe_strategy != "all" and date_col in columns:
@@ -126,12 +164,36 @@ def sort_dates(
                     .unique(subset=[date_col], keep="first", maintain_order=True)
                 )
 
-            # Final sort by the main sort columns
-            result_df = (
+            # Final sort by the main sort columns (preserving null positions)
+            result_with_idx = (
                 result_df
+                .with_row_index("_orig_idx")
                 .with_columns(cast_expressions)
-                .sort(by=temp_sort_cols)
-                .drop(temp_sort_cols)
+            )
+
+            valid_dedupe = result_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_not_null()).collect()
+            null_dedupe = result_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_null()).collect()
+
+            if valid_dedupe.height > 0:
+                valid_positions = valid_dedupe["_orig_idx"].to_list()
+                sorted_dedupe = valid_dedupe.sort(by=temp_sort_cols)
+                sorted_dedupe = sorted_dedupe.with_columns(
+                    polars.Series("_new_idx", valid_positions)
+                )
+            else:
+                sorted_dedupe = valid_dedupe.with_columns(
+                    polars.col("_orig_idx").alias("_new_idx")
+                )
+
+            null_dedupe = null_dedupe.with_columns(
+                polars.col("_orig_idx").alias("_new_idx")
+            )
+
+            result_df = (
+                polars.concat([sorted_dedupe, null_dedupe])
+                .sort("_new_idx")
+                .drop(["_orig_idx", "_new_idx"] + temp_sort_cols)
+                .lazy()
             )
 
             post_dedupe = result_df.select(polars.len()).collect().item()
