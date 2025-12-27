@@ -59,11 +59,21 @@ def sort_dates(
 
     is_lazy = isinstance(df, polars.LazyFrame)
 
+    # Create temporary columns cast to Date type to ensure chronological sorting
+    # This handles cases where dates might be stored as strings
+    temp_sort_cols = [f"_sort_{col}" for col in sort_columns]
+    cast_expressions = [
+        polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
+        for col in sort_columns
+    ]
+
     df_with_idx = (
         df.lazy()
+        .with_columns(cast_expressions)
         .with_row_index("_original_idx")
-        .sort(by=sort_columns)
+        .sort(by=temp_sort_cols, nulls_last=True)
         .with_row_index("_sorted_idx")
+        .drop(temp_sort_cols)
     )
 
     mismatches = (
@@ -91,20 +101,38 @@ def sort_dates(
         if declaration_col in columns:
             pre_dedupe = result_df.select(polars.len()).collect().item()
 
+            # Create temporary sort columns for deduplication sorting
+            dedupe_sort_cols = [date_col, declaration_col]
+            temp_dedupe_cols = [f"_sort_{col}" for col in dedupe_sort_cols]
+            dedupe_cast_exprs = [
+                polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
+                for col in dedupe_sort_cols
+            ]
+
             if dedupe_strategy == "earliest":
                 result_df = (
                     result_df
-                    .sort(by=[date_col, declaration_col])
+                    .with_columns(dedupe_cast_exprs)
+                    .sort(by=temp_dedupe_cols, nulls_last=True)
+                    .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
                 )
             elif dedupe_strategy == "latest":
                 result_df = (
                     result_df
-                    .sort(by=[date_col, declaration_col], descending=[False, True])
+                    .with_columns(dedupe_cast_exprs)
+                    .sort(by=temp_dedupe_cols, descending=[False, True], nulls_last=True)
+                    .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
                 )
 
-            result_df = result_df.sort(by=sort_columns)
+            # Final sort by the main sort columns
+            result_df = (
+                result_df
+                .with_columns(cast_expressions)
+                .sort(by=temp_sort_cols, nulls_last=True)
+                .drop(temp_sort_cols)
+            )
 
             post_dedupe = result_df.select(polars.len()).collect().item()
             removed_count = pre_dedupe - post_dedupe
