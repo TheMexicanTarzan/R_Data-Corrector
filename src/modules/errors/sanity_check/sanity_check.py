@@ -77,8 +77,9 @@ def sort_dates(
 
     # Identify rows with valid (non-null) primary sort column
     # We only sort non-null rows; null rows stay in their original positions
-    valid_rows = df_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_not_null()).collect()
-    null_rows = df_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_null()).collect()
+    # Note: Check the ORIGINAL column for null, not the cast column (cast may fail for some date formats)
+    valid_rows = df_with_idx.filter(polars.col(primary_sort_col).is_not_null()).collect()
+    null_rows = df_with_idx.filter(polars.col(primary_sort_col).is_null()).collect()
 
     if valid_rows.height > 0:
         # Get the original positions of valid rows (these are the slots we'll fill with sorted data)
@@ -111,11 +112,12 @@ def sort_dates(
     )
 
     # Detect mismatches (only for valid rows since null rows don't move)
+    # Note: Check the ORIGINAL column for null, not the cast column
     mismatches = (
         df_with_idx
         .filter(
             (polars.col("_original_idx") != polars.col("_sorted_idx")) &
-            polars.col(f"_sort_{primary_sort_col}").is_not_null()
+            polars.col(primary_sort_col).is_not_null()
         )
         .select(["_original_idx", "_sorted_idx"] + sort_columns)
         .collect()
@@ -171,8 +173,8 @@ def sort_dates(
                 .with_columns(cast_expressions)
             )
 
-            valid_dedupe = result_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_not_null()).collect()
-            null_dedupe = result_with_idx.filter(polars.col(f"_sort_{primary_sort_col}").is_null()).collect()
+            valid_dedupe = result_with_idx.filter(polars.col(primary_sort_col).is_not_null()).collect()
+            null_dedupe = result_with_idx.filter(polars.col(primary_sort_col).is_null()).collect()
 
             if valid_dedupe.height > 0:
                 valid_positions = valid_dedupe["_orig_idx"].to_list()
