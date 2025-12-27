@@ -64,14 +64,19 @@ def sort_dates(
     primary_sort_col = sort_columns[0]
     temp_sort_cols = [f"_sort_{col}" for col in sort_columns]
 
-    # Build cast expressions that handle the database's date format (MM/DD/YYYY)
+    # Get schema to check column types
+    schema = df.collect_schema() if is_lazy else df.schema
+
+    # Build cast expressions based on column type
     cast_expressions = []
     for col in sort_columns:
-        # Try direct cast first (works if already Date type), then parse as MM/DD/YYYY string
-        expr = polars.coalesce(
-            polars.col(col).cast(polars.Date, strict=False),
-            polars.col(col).str.to_date("%m/%d/%Y", strict=False),
-        ).alias(f"_sort_{col}")
+        col_dtype = schema.get(col)
+        if col_dtype == polars.String or col_dtype == polars.Utf8:
+            # For string columns, parse as MM/DD/YYYY
+            expr = polars.col(col).str.to_date("%m/%d/%Y", strict=False).alias(f"_sort_{col}")
+        else:
+            # For Date columns or other types, cast to Date (no-op if already Date)
+            expr = polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
         cast_expressions.append(expr)
 
     # Add original index and cast date columns
@@ -152,10 +157,11 @@ def sort_dates(
             temp_dedupe_cols = [f"_sort_{col}" for col in dedupe_sort_cols]
             dedupe_cast_exprs = []
             for col in dedupe_sort_cols:
-                expr = polars.coalesce(
-                    polars.col(col).cast(polars.Date, strict=False),
-                    polars.col(col).str.to_date("%m/%d/%Y", strict=False),
-                ).alias(f"_sort_{col}")
+                col_dtype = schema.get(col)
+                if col_dtype == polars.String or col_dtype == polars.Utf8:
+                    expr = polars.col(col).str.to_date("%m/%d/%Y", strict=False).alias(f"_sort_{col}")
+                else:
+                    expr = polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
                 dedupe_cast_exprs.append(expr)
 
             if dedupe_strategy == "earliest":
