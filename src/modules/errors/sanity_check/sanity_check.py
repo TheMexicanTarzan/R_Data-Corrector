@@ -867,7 +867,7 @@ def validate_financial_equivalencies(
     ticker: str,
     columns: list[str] = [""],
     date_col: str = "m_date",
-    tolerance: float = 1.0
+    tolerance: float = 0.05
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict]:
     """
     Validate and clean financial statement data by enforcing accounting identities.
@@ -920,7 +920,13 @@ def validate_financial_equivalencies(
             "fbs_retained_earnings",
             "fbs_other_stockholder_equity"
         ],
-        "cash": ["fcf_period_end_cash", "fbs_cash_and_cash_equivalents"]
+        "cash": ["fcf_period_end_cash", "fbs_cash_and_cash_equivalents"],
+        "balance_sheet": [
+            "fbs_assets",
+            "fbs_liabilities",
+            "fbs_stockholder_equity",
+            "fbs_noncontrolling_interest"
+        ]
     }
 
     # Initialize error log structure
@@ -948,7 +954,8 @@ def validate_financial_equivalencies(
         component_sum = polars.col(current_col) + polars.col(noncurrent_col)
 
         # Identify violations (absolute difference > tolerance)
-        assets_violation = (polars.col(total_col) - component_sum).abs() > tolerance
+        assets_violation = ((polars.col(total_col) - component_sum).abs() >
+                            (polars.col(total_col).abs() * tolerance))
 
         # Calculate scaling factor
         scaling_factor = polars.when(component_sum != 0).then(
@@ -996,7 +1003,8 @@ def validate_financial_equivalencies(
         component_sum = polars.col(current_col) + polars.col(noncurrent_col)
 
         # Identify violations (absolute difference > tolerance)
-        liabilities_violation = (polars.col(total_col) - component_sum).abs() > tolerance
+        liabilities_violation = ((polars.col(total_col) - component_sum).abs() >
+                                 (polars.col(total_col)).abs() * tolerance)
 
         # Calculate scaling factor
         scaling_factor = polars.when(component_sum != 0).then(
@@ -1111,7 +1119,8 @@ def validate_financial_equivalencies(
         component_sum = sum(polars.col(col) for col in component_cols)
 
         # Identify violations
-        equity_violation = (polars.col(total_col) - component_sum).abs() > tolerance
+        equity_violation = ((polars.col(total_col) - component_sum).abs() >
+                            (polars.col(total_col)).abs() * tolerance)
 
         violation_flag_name = "_warn_equity"
         soft_violation_exprs.append(equity_violation.alias(violation_flag_name))
@@ -1130,7 +1139,8 @@ def validate_financial_equivalencies(
         columns_for_soft_logging.update([cash_col_1, cash_col_2])
 
         # Identify violations
-        cash_violation = (polars.col(cash_col_1) - polars.col(cash_col_2)).abs() > tolerance
+        cash_violation = ((polars.col(cash_col_1) - polars.col(cash_col_2)).abs() >
+                          (polars.col(cash_col_1).abs() * tolerance))
 
         violation_flag_name = "_warn_cash"
         soft_violation_exprs.append(cash_violation.alias(violation_flag_name))
@@ -1143,6 +1153,36 @@ def validate_financial_equivalencies(
 
     # Log soft filter violations and create data_warning column
     data_warning_expr = polars.lit(False)
+
+    # Process Fundamental Accounting Identity (Assets = Liabs + Equity + NCI)
+    if all(col in schema_cols for col in soft_filter_columns["balance_sheet"]):
+        assets_col = "fbs_assets"
+        liabs_col = "fbs_liabilities"
+        equity_col = "fbs_stockholder_equity"
+        nci_col = "fbs_noncontrolling_interest"
+
+        columns_for_soft_logging.update([assets_col, liabs_col, equity_col, nci_col])
+
+        # Calculate Total Claims (Pasivo + Capital + Interés Minoritario)
+        # Usamos fill_null(0) porque el NCI suele ser nulo en muchas empresas
+        total_claims = (
+                polars.col(liabs_col) +
+                polars.col(equity_col) +
+                polars.col(nci_col).fill_null(0.0)
+        )
+
+        # Identify violations (Dynamic Tolerance)
+        bs_violation = (polars.col(assets_col) - total_claims).abs() > (polars.col(assets_col).abs() * tolerance)
+
+        violation_flag_name = "_warn_balance_sheet"
+        soft_violation_exprs.append(bs_violation.alias(violation_flag_name))
+        soft_violation_info.append({
+            "flag": violation_flag_name,
+            "error_type": "accounting_equation_mismatch",  # A != L + E + NCI
+            "total_col": assets_col,  # Usamos Activos como la verdad base
+            # Pasamos las columnas componentes para el log detallado
+            "component_cols": [liabs_col, equity_col, nci_col]
+        })
 
     if soft_violation_exprs:
         # Create warning flag: True if any soft filter violation
@@ -1183,6 +1223,20 @@ def validate_financial_equivalencies(
                         warning_entry["total"] = total_val
                         warning_entry["components"] = component_vals
                         warning_entry["component_sum"] = component_sum_val
+                        warning_entry["difference"] = total_val - component_sum_val
+
+                    elif info["error_type"] == "accounting_equation_mismatch":
+                        total_col = info["total_col"]
+                        component_cols = info["component_cols"]
+
+                        total_val = row.get(total_col)
+                        # Handle nulls as 0 for the report
+                        component_vals = {col: (row.get(col) or 0.0) for col in component_cols}
+                        component_sum_val = sum(component_vals.values())
+
+                        warning_entry["assets (total)"] = total_val
+                        warning_entry["claims_sum"] = component_sum_val
+                        warning_entry["components"] = component_vals
                         warning_entry["difference"] = total_val - component_sum_val
 
                     elif info["error_type"] == "cash_mismatch":

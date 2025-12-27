@@ -16,7 +16,8 @@ from src.modules.errors.sanity_check.sanity_check import (
     fill_negatives_market,
     zero_wipeout,
     mkt_cap_scale_error,
-    ohlc_integrity
+    ohlc_integrity,
+    validate_financial_equivalencies
 )
 from src.features.lazy_parallelization import parallel_process_tickers
 
@@ -129,10 +130,10 @@ ohlc_integrity_columns = [
 #         function = ohlc_integrity
 #     )
 
-dataframe_dict_clean_negatives_market, logs = parallel_process_tickers(
+dataframe_dict_clean_financial_equivalencies, logs = parallel_process_tickers(
         data_dict = dataframe_dict,
         columns = date_cols,
-        function = sort_dates,
+        function = validate_financial_equivalencies,
     )
 
 print("done")
