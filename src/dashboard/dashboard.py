@@ -675,25 +675,33 @@ class DummyDataGenerator:
 class FinancialDashboard:
     """Main dashboard application class."""
 
-    def __init__(self, original_dfs: Dict[str, pl.DataFrame],
-                 cleaned_dfs: Dict[str, pl.DataFrame],
+    def __init__(self, original_dfs: Dict[str, pl.LazyFrame],
+                 cleaned_dfs: Dict[str, pl.LazyFrame],
                  all_logs: Dict[str, Any]):
         """
-        Initialize the dashboard.
+        Initialize the dashboard with memory-efficient lazy evaluation.
 
         Args:
-            original_dfs: Dictionary of original dataframes by ticker
-            cleaned_dfs: Dictionary of cleaned dataframes by ticker
+            original_dfs: Dictionary of original LazyFrames by ticker
+            cleaned_dfs: Dictionary of cleaned LazyFrames by ticker
             all_logs: Dictionary of all cleaning logs by category
         """
+        # Store LazyFrames (not collected - saves memory!)
         self.original_dfs = original_dfs
         self.cleaned_dfs = cleaned_dfs
         self.all_logs = all_logs
 
-        # Normalize logs
+        # Normalize logs (only once, but efficiently)
+        print("Initializing dashboard with lazy evaluation for memory efficiency...")
         self.normalized_logs = LogNormalizer.normalize_logs(
-            all_logs, original_dfs, cleaned_dfs
+            all_logs, {}, {}  # Don't need DataFrames for log normalization
         )
+
+        # Limit normalized logs to prevent memory issues
+        if self.normalized_logs.height > 100_000:
+            print(f"⚠ Large number of errors ({self.normalized_logs.height:,}). Sampling for performance...")
+            # Keep all unique tickers but limit errors per ticker
+            self.normalized_logs = self._sample_logs_efficiently(self.normalized_logs)
 
         # Initialize Dash app
         self.app = dash.Dash(
@@ -708,6 +716,58 @@ class FinancialDashboard:
 
         self._build_layout()
         self._register_callbacks()
+
+    def _sample_logs_efficiently(self, logs_df: pl.DataFrame, max_per_ticker: int = 1000) -> pl.DataFrame:
+        """
+        Sample logs to reduce memory usage while keeping all tickers represented.
+
+        Args:
+            logs_df: Full logs DataFrame
+            max_per_ticker: Maximum errors per ticker to keep
+
+        Returns:
+            Sampled DataFrame
+        """
+        # Group by ticker and take top N errors by severity
+        severity_order = {"error": 0, "warning": 1, "info": 2}
+
+        sampled = (
+            logs_df
+            .with_columns([
+                pl.col("severity").map_elements(
+                    lambda x: severity_order.get(x, 3),
+                    return_dtype=pl.Int32
+                ).alias("_severity_rank")
+            ])
+            .sort(["ticker", "_severity_rank", "date"])
+            .group_by("ticker")
+            .head(max_per_ticker)
+            .drop("_severity_rank")
+        )
+
+        print(f"  Sampled from {logs_df.height:,} to {sampled.height:,} errors")
+        return sampled
+
+    def _get_ticker_data(self, ticker: str, max_rows: int = 10_000) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """
+        Lazily load data for a specific ticker only when needed.
+
+        Args:
+            ticker: Ticker symbol
+            max_rows: Maximum rows to load (for memory efficiency)
+
+        Returns:
+            Tuple of (original_df, cleaned_df)
+        """
+        if ticker not in self.original_dfs:
+            return pl.DataFrame(), pl.DataFrame()
+
+        # Collect only the specific ticker (lazy evaluation!)
+        # Limit rows to prevent memory issues with very large datasets
+        original = self.original_dfs[ticker].limit(max_rows).collect()
+        cleaned = self.cleaned_dfs.get(ticker, self.original_dfs[ticker]).limit(max_rows).collect()
+
+        return original, cleaned
 
     def load_false_positives(self):
         """Load false positive flags from storage."""
@@ -836,7 +896,9 @@ class FinancialDashboard:
                                     "rowSelection": "single",
                                     "animateRows": False,
                                     "pagination": True,
-                                    "paginationPageSize": 20
+                                    "paginationPageSize": 50,  # Limit rows per page for performance
+                                    "cacheBlockSize": 50,  # Load 50 rows at a time
+                                    "maxBlocksInCache": 10  # Keep max 500 rows in cache
                                 },
                                 style={"height": "400px"}
                             ),
@@ -919,6 +981,24 @@ class FinancialDashboard:
                     pl.col("error_category") == "Financial Equivalencies (Soft)"
                 )
 
+            # Limit rows for performance (take most recent/severe)
+            MAX_DISPLAY_ROWS = 5000
+            if filtered.height > MAX_DISPLAY_ROWS:
+                # Keep most severe errors
+                severity_order = {"error": 0, "warning": 1, "info": 2}
+                filtered = (
+                    filtered
+                    .with_columns([
+                        pl.col("severity").map_elements(
+                            lambda x: severity_order.get(x, 3),
+                            return_dtype=pl.Int32
+                        ).alias("_sev_rank")
+                    ])
+                    .sort(["_sev_rank", "date"])
+                    .head(MAX_DISPLAY_ROWS)
+                    .drop("_sev_rank")
+                )
+
             # Convert to dict for AG Grid
             row_data = filtered.to_dicts()
 
@@ -956,8 +1036,8 @@ class FinancialDashboard:
                     x=0.5, y=0.5, showarrow=False
                 )
 
-            original_df = self.original_dfs[ticker]
-            cleaned_df = self.cleaned_dfs[ticker]
+            # Lazy load only when needed - saves memory!
+            original_df, cleaned_df = self._get_ticker_data(ticker, max_rows=10_000)
 
             # Determine which column to plot
             column_to_plot = None
@@ -978,8 +1058,8 @@ class FinancialDashboard:
                 elif "Negative Fundamental" in category:
                     column_to_plot = "fbs_assets"
                 elif "Financial Equivalencies" in category:
-                    # Special handling for accounting equation
-                    return self._create_accounting_equation_chart(ticker, original_df, cleaned_df)
+                    # Special handling for accounting equation (loads data internally)
+                    return self._create_accounting_equation_chart(ticker)
                 else:
                     column_to_plot = "m_close"
 
@@ -1104,12 +1184,13 @@ class FinancialDashboard:
 
             return ""
 
-    def _create_accounting_equation_chart(self, ticker: str,
-                                         original_df: pl.DataFrame,
-                                         cleaned_df: pl.DataFrame) -> go.Figure:
+    def _create_accounting_equation_chart(self, ticker: str) -> go.Figure:
         """
         Create special chart for accounting equation: Assets vs (Liabilities + Equity + NCI)
         """
+        # Lazy load data only when needed
+        original_df, cleaned_df = self._get_ticker_data(ticker, max_rows=10_000)
+
         fig = make_subplots(
             rows=2, cols=1,
             subplot_titles=("Accounting Equation Components", "Difference (Assets - Claims)"),

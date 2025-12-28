@@ -130,26 +130,16 @@ dataframe_dict_clean_financial_equivalencies, financial_unequivalencies_logs = p
         function = validate_financial_equivalencies,
     )
 
+print("\n" + "="*60)
+print("Preparing dashboard with memory-efficient lazy evaluation...")
+print("="*60)
 
+# Keep LazyFrames - DON'T collect! (Memory optimization)
+# The dashboard will load data on-demand only when needed
+original_dfs = dataframe_dict
+cleaned_dfs = dataframe_dict_clean_financial_equivalencies
 
-# Collect LazyFrames into DataFrames for dashboard
-original_dfs = {}
-cleaned_dfs = {}
-
-logger.info("Converting LazyFrames to DataFrames for dashboard visualization")
-for ticker in dataframe_dict.keys():
-    try:
-        # Collect original data
-        original_dfs[ticker] = dataframe_dict[ticker].collect()
-
-        # Collect cleaned data (use the final cleaned version)
-        if ticker in dataframe_dict_clean_financial_equivalencies:
-            cleaned_dfs[ticker] = dataframe_dict_clean_financial_equivalencies[ticker].collect()
-
-        logger.info(f"Collected data for {ticker}: {original_dfs[ticker].height} rows")
-    except Exception as e:
-        logger.error(f"Failed to collect data for {ticker}: {e}")
-
+logger.info(f"Prepared {len(original_dfs)} tickers for lazy loading")
 
 # Organize all logs
 all_logs = {
@@ -183,9 +173,33 @@ for category, logs in all_logs.items():
             elif isinstance(log_item, list):
                 total_errors += len(log_item)
 
+print(f"✓ Prepared {len(original_dfs)} tickers for lazy loading")
+print(f"✓ Total errors found: {total_errors:,}")
+print("\n💡 Memory-efficient mode: Data loaded on-demand only")
+
+# Create and run dashboard
+print("\n" + "="*60)
+print("Initializing Dashboard...")
+print("="*60 + "\n")
 
 dashboard = FinancialDashboard(original_dfs, cleaned_dfs, all_logs)
 
+print("\n" + "="*60)
+print("Dashboard is now running at: http://localhost:8050")
+print("="*60)
+print("\nMemory-Efficient Features:")
+print("  • Lazy evaluation - data loaded only when viewing specific tickers")
+print("  • Automatic sampling for large error sets (>100K errors)")
+print("  • Maximum 10,000 rows per ticker per chart")
+print("  • Low RAM footprint - suitable for large datasets")
+print("\nFeatures:")
+print("  • Filter by ticker and error category")
+print("  • View detailed error logs in AG Grid table")
+print("  • Compare original vs cleaned data in time series charts")
+print("  • Flag false positives for future reference")
+print("  • Special accounting equation visualizations")
+print("\nPress Ctrl+C to stop the dashboard server")
+print("="*60 + "\n")
 
 # Run the dashboard
 dashboard.run(debug=True, port=8050)
