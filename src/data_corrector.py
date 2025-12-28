@@ -13,6 +13,7 @@ from src.modules.errors.sanity_check.sanity_check import (
     validate_financial_equivalencies
 )
 from src.features.lazy_parallelization import parallel_process_tickers
+from src.dashboard.dashboard import FinancialDashboard
 
 
 current_dir = Path.cwd()
@@ -129,21 +130,9 @@ dataframe_dict_clean_financial_equivalencies, financial_unequivalencies_logs = p
         function = validate_financial_equivalencies,
     )
 
-print("done")
 
-# =============================================================================
-# Launch Dashboard with Real Data
-# =============================================================================
-
-print("\n" + "="*60)
-print("Preparing to launch Financial Data Cleaning Dashboard...")
-print("="*60)
-
-# Import dashboard
-from src.dashboard.dashboard import FinancialDashboard
 
 # Collect LazyFrames into DataFrames for dashboard
-print("\nCollecting data for dashboard...")
 original_dfs = {}
 cleaned_dfs = {}
 
@@ -161,8 +150,6 @@ for ticker in dataframe_dict.keys():
     except Exception as e:
         logger.error(f"Failed to collect data for {ticker}: {e}")
 
-print(f"✓ Collected {len(original_dfs)} tickers")
-print(f"✓ Total rows: {sum(df.height for df in original_dfs.values()):,}")
 
 # Organize all logs
 all_logs = {
@@ -196,27 +183,9 @@ for category, logs in all_logs.items():
             elif isinstance(log_item, list):
                 total_errors += len(log_item)
 
-print(f"✓ Total errors found: {total_errors:,}")
-
-# Create and run dashboard
-print("\n" + "="*60)
-print("Initializing Dashboard...")
-print("="*60)
 
 dashboard = FinancialDashboard(original_dfs, cleaned_dfs, all_logs)
 
-print("\n✓ Dashboard initialized successfully")
-print("\n" + "="*60)
-print("Dashboard is now running at: http://localhost:8050")
-print("="*60)
-print("\nFeatures:")
-print("  • Filter by ticker and error category")
-print("  • View detailed error logs in AG Grid table")
-print("  • Compare original vs cleaned data in time series charts")
-print("  • Flag false positives for future reference")
-print("  • Special accounting equation visualizations")
-print("\nPress Ctrl+C to stop the dashboard server")
-print("="*60 + "\n")
 
 # Run the dashboard
 dashboard.run(debug=True, port=8050)
