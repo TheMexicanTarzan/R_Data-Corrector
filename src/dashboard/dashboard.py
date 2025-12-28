@@ -48,58 +48,82 @@ class LogNormalizer:
         Returns:
             Unified Polars DataFrame with standardized columns
         """
+        print("Normalizing logs for dashboard...")
         normalized_rows = []
 
-        for category, logs in all_logs.items():
-            if category == "negative_fundamentals":
-                normalized_rows.extend(
-                    LogNormalizer._normalize_negative_fundamentals(logs)
-                )
-            elif category == "negative_market":
-                normalized_rows.extend(
-                    LogNormalizer._normalize_negative_market(logs)
-                )
-            elif category == "zero_wipeout":
-                normalized_rows.extend(
-                    LogNormalizer._normalize_zero_wipeout(logs)
-                )
-            elif category == "mkt_cap_scale":
-                normalized_rows.extend(
-                    LogNormalizer._normalize_mkt_cap_scale(logs)
-                )
-            elif category == "ohlc_integrity":
-                normalized_rows.extend(
-                    LogNormalizer._normalize_ohlc_integrity(logs)
-                )
-            elif category == "financial_equivalencies":
-                normalized_rows.extend(
-                    LogNormalizer._normalize_financial_equivalencies(logs)
-                )
-            elif category == "sort_dates":
-                normalized_rows.extend(
-                    LogNormalizer._normalize_sort_dates(logs)
-                )
+        # Process each category with progress indication
+        categories = [
+            ("negative_fundamentals", LogNormalizer._normalize_negative_fundamentals),
+            ("negative_market", LogNormalizer._normalize_negative_market),
+            ("zero_wipeout", LogNormalizer._normalize_zero_wipeout),
+            ("mkt_cap_scale", LogNormalizer._normalize_mkt_cap_scale),
+            ("ohlc_integrity", LogNormalizer._normalize_ohlc_integrity),
+            ("financial_equivalencies", LogNormalizer._normalize_financial_equivalencies),
+            ("sort_dates", LogNormalizer._normalize_sort_dates)
+        ]
+
+        for category_name, normalizer_func in categories:
+            if category_name in all_logs and all_logs[category_name]:
+                print(f"  Processing {category_name}...", end=" ")
+                try:
+                    rows = normalizer_func(all_logs[category_name])
+                    normalized_rows.extend(rows)
+                    print(f"✓ ({len(rows)} entries)")
+                except Exception as e:
+                    print(f"✗ Error: {e}")
+                    # Continue processing other categories
+                    continue
+
+        # Define explicit schema for type safety and performance
+        schema = {
+            "ticker": pl.Utf8,
+            "date": pl.Utf8,
+            "error_category": pl.Utf8,
+            "error_type": pl.Utf8,
+            "column": pl.Utf8,
+            "original_value": pl.Float64,
+            "corrected_value": pl.Float64,
+            "message": pl.Utf8,
+            "severity": pl.Utf8,
+            "false_positive": pl.Boolean
+        }
 
         if not normalized_rows:
             # Return empty DataFrame with schema
-            return pl.DataFrame(schema={
-                "ticker": pl.Utf8,
-                "date": pl.Utf8,
-                "error_category": pl.Utf8,
-                "error_type": pl.Utf8,
-                "column": pl.Utf8,
-                "original_value": pl.Float64,
-                "corrected_value": pl.Float64,
-                "message": pl.Utf8,
-                "severity": pl.Utf8,
-                "false_positive": pl.Boolean
-            })
+            return pl.DataFrame(schema=schema)
 
-        df = pl.DataFrame(normalized_rows)
+        # Ensure all rows have consistent types before creating DataFrame
+        for row in normalized_rows:
+            # Ensure float fields are properly typed (convert None to float NaN for consistency)
+            if row.get("original_value") is None:
+                row["original_value"] = float('nan')
+            elif not isinstance(row["original_value"], (int, float)):
+                try:
+                    row["original_value"] = float(row["original_value"])
+                except (ValueError, TypeError):
+                    row["original_value"] = float('nan')
 
-        # Add false_positive column if not present
-        if "false_positive" not in df.columns:
-            df = df.with_columns(pl.lit(False).alias("false_positive"))
+            if row.get("corrected_value") is None:
+                row["corrected_value"] = float('nan')
+            elif not isinstance(row["corrected_value"], (int, float)):
+                try:
+                    row["corrected_value"] = float(row["corrected_value"])
+                except (ValueError, TypeError):
+                    row["corrected_value"] = float('nan')
+
+            # Ensure string fields are strings
+            for field in ["ticker", "date", "error_category", "error_type", "column", "message", "severity"]:
+                if row.get(field) is None:
+                    row[field] = ""
+                else:
+                    row[field] = str(row[field])
+
+            # Ensure boolean field
+            if "false_positive" not in row:
+                row["false_positive"] = False
+
+        # Create DataFrame with explicit schema for better performance
+        df = pl.DataFrame(normalized_rows, schema=schema, infer_schema_length=None)
 
         return df
 
@@ -112,14 +136,20 @@ class LogNormalizer:
                 for column, entries in log_dict.items():
                     if isinstance(entries, list):
                         for entry in entries:
+                            # Safely extract and convert values
+                            try:
+                                orig_val = float(entry.get(column, 0))
+                            except (ValueError, TypeError):
+                                orig_val = float('nan')
+
                             rows.append({
-                                "ticker": entry.get("ticker", ""),
+                                "ticker": str(entry.get("ticker", "")),
                                 "date": str(entry.get("m_date", "")),
                                 "error_category": "Negative Fundamentals",
                                 "error_type": "negative_value",
-                                "column": column,
-                                "original_value": float(entry.get(column, 0)),
-                                "corrected_value": None,  # Forward filled
+                                "column": str(column),
+                                "original_value": orig_val,
+                                "corrected_value": float('nan'),  # Forward filled - actual value unknown
                                 "message": f"Negative value in {column} replaced with forward fill",
                                 "severity": "warning",
                                 "false_positive": False
@@ -133,14 +163,25 @@ class LogNormalizer:
         for log_list in logs:
             if isinstance(log_list, list):
                 for entry in log_list:
+                    # Safely convert values
+                    try:
+                        orig_val = float(entry.get("original_value", float('nan')))
+                    except (ValueError, TypeError):
+                        orig_val = float('nan')
+
+                    try:
+                        corr_val = float(entry.get("corrected_value", float('nan')))
+                    except (ValueError, TypeError):
+                        corr_val = float('nan')
+
                     rows.append({
-                        "ticker": entry.get("ticker", ""),
+                        "ticker": str(entry.get("ticker", "")),
                         "date": str(entry.get("date", "")),
                         "error_category": "Negative Market Data",
                         "error_type": "negative_value",
-                        "column": entry.get("column", ""),
-                        "original_value": entry.get("original_value"),
-                        "corrected_value": entry.get("corrected_value"),
+                        "column": str(entry.get("column", "")),
+                        "original_value": orig_val,
+                        "corrected_value": corr_val,
                         "message": f"Method: {entry.get('method', 'unknown')}",
                         "severity": "warning",
                         "false_positive": False
@@ -154,9 +195,13 @@ class LogNormalizer:
         for log_list in logs:
             if isinstance(log_list, list):
                 for entry in log_list:
-                    ticker = entry.get("ticker", "")
+                    ticker = str(entry.get("ticker", ""))
                     date = str(entry.get("m_date", ""))
-                    volume = entry.get("m_volume", 0)
+
+                    try:
+                        volume = float(entry.get("m_volume", 0))
+                    except (ValueError, TypeError):
+                        volume = 0.0
 
                     # Multiple columns might be zero in same row
                     for key, value in entry.items():
@@ -166,10 +211,10 @@ class LogNormalizer:
                                 "date": date,
                                 "error_category": "Zero Wipeout",
                                 "error_type": "zero_with_volume",
-                                "column": key,
+                                "column": str(key),
                                 "original_value": 0.0,
-                                "corrected_value": None,  # Forward filled
-                                "message": f"Zero value with volume={volume}",
+                                "corrected_value": float('nan'),  # Forward filled - actual value unknown
+                                "message": f"Zero value with volume={volume:.0f}",
                                 "severity": "error",
                                 "false_positive": False
                             })
@@ -183,19 +228,25 @@ class LogNormalizer:
             if isinstance(log_list, list):
                 for entry in log_list:
                     # Extract the column that had the error (excluding ticker, date, error_type)
-                    ticker = entry.get("ticker", "")
+                    ticker = str(entry.get("ticker", ""))
                     date = str(entry.get("m_date", ""))
 
                     for key, value in entry.items():
                         if key not in ["ticker", "m_date", "error_type"]:
+                            # Safely convert value
+                            try:
+                                orig_val = float(value)
+                            except (ValueError, TypeError):
+                                orig_val = float('nan')
+
                             rows.append({
                                 "ticker": ticker,
                                 "date": date,
                                 "error_category": "Market Cap Scale",
-                                "error_type": entry.get("error_type", "scale_error"),
-                                "column": key,
-                                "original_value": value,
-                                "corrected_value": None,  # Forward filled
+                                "error_type": str(entry.get("error_type", "scale_error")),
+                                "column": str(key),
+                                "original_value": orig_val,
+                                "corrected_value": float('nan'),  # Forward filled - actual value unknown
                                 "message": "10x jump detected and corrected",
                                 "severity": "error",
                                 "false_positive": False
@@ -232,8 +283,8 @@ class LogNormalizer:
             return rows
 
         try:
-            error_type = entry.get("error_type", "")
-            column_group = entry.get("column_group", "")
+            error_type = str(entry.get("error_type", ""))
+            column_group = str(entry.get("column_group", ""))
 
             # Determine which column was corrected
             if error_type == "high_not_maximum":
@@ -251,15 +302,26 @@ class LogNormalizer:
             else:
                 return rows  # Skip unknown error types
 
+            # Safely convert values to float
+            try:
+                old_val = float(old_val) if old_val is not None else float('nan')
+            except (ValueError, TypeError):
+                old_val = float('nan')
+
+            try:
+                new_val = float(new_val) if new_val is not None else float('nan')
+            except (ValueError, TypeError):
+                new_val = float('nan')
+
             rows.append({
-                "ticker": entry.get("ticker", ""),
+                "ticker": str(entry.get("ticker", "")),
                 "date": str(entry.get("date", "")),
                 "error_category": "OHLC Integrity",
                 "error_type": error_type,
-                "column": column,
+                "column": str(column),
                 "original_value": old_val,
                 "corrected_value": new_val,
-                "message": entry.get("message", ""),
+                "message": str(entry.get("message", "")),
                 "severity": "error",
                 "false_positive": False
             })
@@ -280,7 +342,7 @@ class LogNormalizer:
             # Process hard filter errors
             hard_errors = log_dict.get("hard_filter_errors", [])
             for entry in hard_errors:
-                error_type = entry.get("error_type", "")
+                error_type = str(entry.get("error_type", ""))
 
                 # Determine the columns involved
                 if "assets" in error_type:
@@ -290,13 +352,19 @@ class LogNormalizer:
                 else:
                     cols_involved = "various"
 
+                # Safely convert difference to float
+                try:
+                    diff_val = float(entry.get("difference", 0))
+                except (ValueError, TypeError):
+                    diff_val = float('nan')
+
                 rows.append({
-                    "ticker": entry.get("ticker", ""),
+                    "ticker": str(entry.get("ticker", "")),
                     "date": str(entry.get("date", "")),
                     "error_category": "Financial Equivalencies (Hard)",
                     "error_type": error_type,
                     "column": cols_involved,
-                    "original_value": entry.get("difference"),
+                    "original_value": diff_val,
                     "corrected_value": 0.0,  # After correction, difference is 0
                     "message": f"Method: {entry.get('correction_method', 'unknown')}",
                     "severity": "error",
@@ -306,7 +374,7 @@ class LogNormalizer:
             # Process soft filter warnings
             soft_warnings = log_dict.get("soft_filter_warnings", [])
             for entry in soft_warnings:
-                error_type = entry.get("error_type", "")
+                error_type = str(entry.get("error_type", ""))
 
                 # Determine the columns involved
                 if "equity" in error_type:
@@ -318,15 +386,21 @@ class LogNormalizer:
                 else:
                     cols_involved = "various"
 
+                # Safely convert difference to float
+                try:
+                    diff_val = float(entry.get("difference", 0))
+                except (ValueError, TypeError):
+                    diff_val = float('nan')
+
                 rows.append({
-                    "ticker": entry.get("ticker", ""),
+                    "ticker": str(entry.get("ticker", "")),
                     "date": str(entry.get("date", "")),
                     "error_category": "Financial Equivalencies (Soft)",
                     "error_type": error_type,
                     "column": cols_involved,
-                    "original_value": entry.get("difference"),
-                    "corrected_value": None,  # Soft warnings don't correct
-                    "message": f"Warning - not corrected",
+                    "original_value": diff_val,
+                    "corrected_value": float('nan'),  # Soft warnings don't correct
+                    "message": "Warning - not corrected",
                     "severity": "warning",
                     "false_positive": False
                 })
@@ -340,30 +414,47 @@ class LogNormalizer:
         for log_list in logs:
             if isinstance(log_list, list):
                 for entry in log_list:
-                    error_type = entry.get("error_type", "")
+                    error_type = str(entry.get("error_type", ""))
 
                     if error_type == "order_mismatch":
+                        # Safely convert positions to float
+                        try:
+                            orig_pos = float(entry.get("original_position", 0))
+                        except (ValueError, TypeError):
+                            orig_pos = 0.0
+
+                        try:
+                            sorted_pos = float(entry.get("sorted_position", 0))
+                        except (ValueError, TypeError):
+                            sorted_pos = 0.0
+
                         rows.append({
-                            "ticker": entry.get("ticker", ""),
+                            "ticker": str(entry.get("ticker", "")),
                             "date": str(entry.get("m_date", "")),
                             "error_category": "Date Sorting",
                             "error_type": "order_mismatch",
                             "column": "dates",
-                            "original_value": float(entry.get("original_position", 0)),
-                            "corrected_value": float(entry.get("sorted_position", 0)),
-                            "message": f"Row moved from position {entry.get('original_position')} to {entry.get('sorted_position')}",
+                            "original_value": orig_pos,
+                            "corrected_value": sorted_pos,
+                            "message": f"Row moved from position {int(orig_pos)} to {int(sorted_pos)}",
                             "severity": "info",
                             "false_positive": False
                         })
                     elif error_type == "duplicates_removed":
+                        # Safely convert count to float
+                        try:
+                            dup_count = float(entry.get("duplicates_removed", 0))
+                        except (ValueError, TypeError):
+                            dup_count = 0.0
+
                         rows.append({
-                            "ticker": entry.get("ticker", ""),
+                            "ticker": str(entry.get("ticker", "")),
                             "date": "",
                             "error_category": "Date Sorting",
                             "error_type": "duplicates_removed",
                             "column": "dates",
-                            "original_value": float(entry.get("duplicates_removed", 0)),
-                            "corrected_value": None,
+                            "original_value": dup_count,
+                            "corrected_value": float('nan'),
                             "message": f"Strategy: {entry.get('strategy', 'unknown')}",
                             "severity": "info",
                             "false_positive": False
