@@ -1277,7 +1277,7 @@ def validate_market_split_consistency(
     columns: list[str] = [""],
     date_col: str = "m_date",
     tolerance: float = 0.01
-) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict]:
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Validate that the relationship between raw market data and split-adjusted market data
     is mathematically consistent with the explicit split events declared in the dataset.
@@ -1312,8 +1312,7 @@ def validate_market_split_consistency(
     Returns:
         tuple containing:
             - Corrected DataFrame/LazyFrame (same type as input)
-            - Dictionary with keys 'hard_filter_errors' (corrected mismatches) and
-              'soft_filter_warnings' (informational), each containing lists of error dicts
+            - List of dictionaries documenting corrections and skipped pairs
 
     Note:
         Corrections recalculate adjusted values using K_expected:
@@ -1326,18 +1325,15 @@ def validate_market_split_consistency(
     # Get schema to check column existence
     schema_cols = set(working_lf.collect_schema().names())
 
-    # Initialize error log structure consistent with validate_financial_equivalencies
-    error_log = {
-        "hard_filter_errors": [],
-        "soft_filter_warnings": []
-    }
+    # Initialize log as a flat list
+    logs = []
 
     # Define the explicit split event columns
     split_numerator_col = "s_split_date_numerator"
     split_denominator_col = "s_split_date_denominator"
 
     # Define explicit price metric pairs to validate
-    price_pairs = [
+    all_price_pairs = [
         ("m_open", "m_open_split_adjusted"),
         ("m_high", "m_high_split_adjusted"),
         ("m_low", "m_low_split_adjusted"),
@@ -1348,39 +1344,86 @@ def validate_market_split_consistency(
     # Define volume pair (inverse relationship)
     volume_pair = ("m_volume", "m_volume_split_adjusted")
 
-    # Filter pairs based on columns parameter - only validate columns that are requested
-    columns_set = set(columns) if columns and columns != [""] else schema_cols
-
-    # Check which pairs are available and requested
-    available_price_pairs = [
-        (raw, adj) for raw, adj in price_pairs
-        if raw in schema_cols and adj in schema_cols
-        and (raw in columns_set or adj in columns_set or columns == [""])
-    ]
-
-    has_volume_pair = (
-        volume_pair[0] in schema_cols and
-        volume_pair[1] in schema_cols and
-        (volume_pair[0] in columns_set or volume_pair[1] in columns_set or columns == [""])
-    )
-
+    # Check for split columns first - if missing, we cannot validate
     has_split_cols = (
         split_numerator_col in schema_cols and
         split_denominator_col in schema_cols
     )
 
-    # If no split columns or no pairs to validate, return early
-    if not has_split_cols or (not available_price_pairs and not has_volume_pair):
-        error_log["soft_filter_warnings"].append({
+    if not has_split_cols:
+        logs.append({
             "ticker": ticker,
-            "warning_type": "missing_columns",
-            "message": "Required split columns or price/volume pairs not found in dataset",
-            "has_split_cols": has_split_cols,
-            "available_price_pairs": len(available_price_pairs),
-            "has_volume_pair": has_volume_pair
+            "error_type": "skipped_validation",
+            "reason": "missing_split_columns",
+            "missing": [col for col in [split_numerator_col, split_denominator_col] if col not in schema_cols]
         })
         result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, error_log)
+        return (result_df, logs)
+
+    # Filter pairs based on columns parameter - only validate columns that are requested
+    columns_set = set(columns) if columns and columns != [""] else schema_cols
+
+    # Check which pairs are available and log skipped pairs
+    available_price_pairs = []
+    for raw_col, adj_col in all_price_pairs:
+        # Check if pair is requested
+        is_requested = (raw_col in columns_set or adj_col in columns_set or columns == [""])
+        if not is_requested:
+            continue
+
+        # Check if both columns exist in schema
+        if raw_col not in schema_cols or adj_col not in schema_cols:
+            missing = []
+            if raw_col not in schema_cols:
+                missing.append(raw_col)
+            if adj_col not in schema_cols:
+                missing.append(adj_col)
+            logs.append({
+                "ticker": ticker,
+                "error_type": "skipped_pair",
+                "pair_type": "price",
+                "raw_column": raw_col,
+                "adjusted_column": adj_col,
+                "reason": "missing_columns",
+                "missing": missing
+            })
+            continue
+
+        available_price_pairs.append((raw_col, adj_col))
+
+    # Check volume pair
+    has_volume_pair = False
+    raw_vol, adj_vol = volume_pair
+    is_volume_requested = (raw_vol in columns_set or adj_vol in columns_set or columns == [""])
+
+    if is_volume_requested:
+        if raw_vol not in schema_cols or adj_vol not in schema_cols:
+            missing = []
+            if raw_vol not in schema_cols:
+                missing.append(raw_vol)
+            if adj_vol not in schema_cols:
+                missing.append(adj_vol)
+            logs.append({
+                "ticker": ticker,
+                "error_type": "skipped_pair",
+                "pair_type": "volume",
+                "raw_column": raw_vol,
+                "adjusted_column": adj_vol,
+                "reason": "missing_columns",
+                "missing": missing
+            })
+        else:
+            has_volume_pair = True
+
+    # If no pairs to validate, return early
+    if not available_price_pairs and not has_volume_pair:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "skipped_validation",
+            "reason": "no_valid_pairs_available"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
 
     # ==================== STEP 1: Calculate Daily Event Factor ====================
     # factor = denominator / numerator
@@ -1561,7 +1604,7 @@ def validate_market_split_consistency(
                     else:  # volume
                         corrected_val = raw_val / k_expected if (raw_val is not None and k_expected != 0) else None
 
-                    error_entry = {
+                    logs.append({
                         "ticker": ticker,
                         "date": row.get(date_col),
                         "error_type": info["error_type"],
@@ -1576,9 +1619,7 @@ def validate_market_split_consistency(
                         "deviation": abs(k_implied - k_expected) if (k_implied is not None and k_expected is not None) else None,
                         "tolerance": tolerance,
                         "correction_method": "recalculated_from_k_expected"
-                    }
-
-                    error_log["hard_filter_errors"].append(error_entry)
+                    })
 
         # Apply corrections
         working_lf = working_lf.with_columns(correction_exprs)
@@ -1593,5 +1634,5 @@ def validate_market_split_consistency(
     # Return in the same format as input
     result_df = working_lf if is_lazy else working_lf.collect()
 
-    return (result_df, error_log)
+    return (result_df, logs)
 
