@@ -1454,7 +1454,9 @@ def validate_market_split_consistency(
 
     # ==================== STEP 3 & 4: Validate Price and Volume Columns ====================
     # Build validation expressions for all pairs
-    violation_exprs = []
+    # Note: We need separate lists because violation flags depend on k_implied columns
+    k_implied_exprs = []
+    violation_flag_exprs = []
     correction_exprs = []
     violation_info = []
     columns_for_logging = {date_col, "_k_expected", "_daily_factor"}
@@ -1494,8 +1496,8 @@ def validate_market_split_consistency(
             .otherwise(polars.col(adj_col))
         ).alias(adj_col)
 
-        violation_exprs.append(k_implied_expr)
-        violation_exprs.append(violation_expr)
+        k_implied_exprs.append(k_implied_expr)
+        violation_flag_exprs.append(violation_expr)
         correction_exprs.append(corrected_adj_expr)
 
         violation_info.append({
@@ -1546,8 +1548,8 @@ def validate_market_split_consistency(
             .otherwise(polars.col(adj_col))
         ).alias(adj_col)
 
-        violation_exprs.append(k_implied_expr)
-        violation_exprs.append(violation_expr)
+        k_implied_exprs.append(k_implied_expr)
+        violation_flag_exprs.append(violation_expr)
         correction_exprs.append(corrected_adj_expr)
 
         violation_info.append({
@@ -1559,8 +1561,9 @@ def validate_market_split_consistency(
             "relationship": "volume"
         })
 
-    # Apply violation expressions
-    working_lf = working_lf.with_columns(violation_exprs)
+    # Apply k_implied expressions first, then violation flags (which depend on k_implied)
+    working_lf = working_lf.with_columns(k_implied_exprs)
+    working_lf = working_lf.with_columns(violation_flag_exprs)
 
     # ==================== STEP 5: Log Violations and Apply Corrections ====================
     if violation_info:
