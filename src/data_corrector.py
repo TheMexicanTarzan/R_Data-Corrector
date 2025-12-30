@@ -84,6 +84,28 @@ ohlc_integrity_columns = [
     "m_vwap"
 ]
 
+market_inconsistencies_columns = [
+    "m_high",
+    "m_low",
+    "m_close",
+    "m_volume",
+    "m_vwap",
+    "m_open_split_adjusted",
+    "m_high_split_adjusted",
+    "m_low_split_adjusted",
+    "m_close_split_adjusted",
+    "m_volume_split_adjusted",
+    "m_vwap_split_adjusted",
+    "s_split_date_numerator",
+    "s_split_date_denominator"
+]
+
+dataframe_dict_sorted_dates, unsorted_dates_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = date_cols,
+        function = sort_dates,
+    )
+
 dataframe_dict_clean_negatives_fundamentals, negative_fundamentals_logs = parallel_process_tickers(
         data_dict = dataframe_dict,
         columns = fundamental_negatives_columns,
@@ -96,13 +118,6 @@ dataframe_dict_clean_negatives_market, negative_market_logs = parallel_process_t
         columns = market_negatives_columns,
         function = fill_negatives_market,
     )
-
-dataframe_dict_sorted_dates, unsorted_dates_logs = parallel_process_tickers(
-        data_dict = dataframe_dict,
-        columns = date_cols,
-        function = sort_dates,
-    )
-
 
 
 dataframe_dict_clean_zero_wipeout, zero_wipeout_logs = parallel_process_tickers(
@@ -126,8 +141,13 @@ dataframe_dict_clean_ohlc_integrity, ohlc_logs = parallel_process_tickers(
 
 dataframe_dict_clean_financial_equivalencies, financial_unequivalencies_logs = parallel_process_tickers(
         data_dict = dataframe_dict,
-        columns = date_cols,
         function = validate_financial_equivalencies,
+    )
+
+dataframe_dict_clean_split_consistency, split_inconsistencies_logs = parallel_process_tickers(
+        data_dict = dataframe_dict,
+        columns = date_cols,
+        function = validate_market_split_consistency,
     )
 
 print("done")
