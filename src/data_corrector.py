@@ -10,7 +10,8 @@ from src.modules.errors.sanity_check.sanity_check import (
     zero_wipeout,
     mkt_cap_scale_error,
     ohlc_integrity,
-    validate_financial_equivalencies
+    validate_financial_equivalencies,
+    validate_market_split_consistency
 )
 from src.features.lazy_parallelization import parallel_process_tickers
 

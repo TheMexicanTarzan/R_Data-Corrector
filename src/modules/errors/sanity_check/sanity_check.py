@@ -1270,3 +1270,328 @@ def validate_financial_equivalencies(
 
     return (result_df, error_log)
 
+
+def validate_market_split_consistency(
+    df: Union[polars.DataFrame, polars.LazyFrame],
+    ticker: str,
+    columns: list[str] = [""],
+    date_col: str = "m_date",
+    tolerance: float = 0.01
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict]:
+    """
+    Validate that the relationship between raw market data and split-adjusted market data
+    is mathematically consistent with the explicit split events declared in the dataset.
+
+    The function computes an expected cumulative adjustment factor (K_expected) from
+    explicit split events and compares it against the implied factor (K_implied) derived
+    from raw/adjusted column pairs. Rows where the implied factor deviates beyond the
+    tolerance are flagged and corrected.
+
+    Logic:
+        1. Calculate Daily Event Factor: factor = s_split_date_denominator / s_split_date_numerator
+           - If numerator/denominator are 0 or Null, assume factor = 1.0 (no split)
+        2. Calculate Cumulative K (K_expected): cumulative product of daily factors
+        3. For price columns: K_implied = adjusted / raw
+        4. For volume: K_implied = raw / adjusted (inverse relationship)
+        5. Validate: |K_implied - K_expected| <= tolerance * |K_expected|
+
+    Explicit Column Pairs Validated:
+        - Split event: s_split_date_numerator, s_split_date_denominator
+        - Price pairs: m_open/m_open_split_adjusted, m_high/m_high_split_adjusted,
+                       m_low/m_low_split_adjusted, m_close/m_close_split_adjusted,
+                       m_vwap/m_vwap_split_adjusted
+        - Volume pair: m_volume/m_volume_split_adjusted
+
+    Args:
+        df: Input Polars LazyFrame or DataFrame containing market data
+        ticker: Ticker symbol for logging purposes
+        columns: List of column names to analyze (used to identify available pairs)
+        date_col: Name of the date column (default: 'm_date')
+        tolerance: Acceptable margin of error for validation (default: 1% = 0.01)
+
+    Returns:
+        tuple containing:
+            - Corrected DataFrame/LazyFrame (same type as input)
+            - Dictionary with keys 'hard_filter_errors' (corrected mismatches) and
+              'soft_filter_warnings' (informational), each containing lists of error dicts
+
+    Note:
+        Corrections recalculate adjusted values using K_expected:
+        - For prices: corrected_adjusted = raw * K_expected
+        - For volume: corrected_adjusted = raw / K_expected
+    """
+    is_lazy = isinstance(df, polars.LazyFrame)
+    working_lf = df if is_lazy else df.lazy()
+
+    # Get schema to check column existence
+    schema_cols = set(working_lf.collect_schema().names())
+
+    # Initialize error log structure consistent with validate_financial_equivalencies
+    error_log = {
+        "hard_filter_errors": [],
+        "soft_filter_warnings": []
+    }
+
+    # Define the explicit split event columns
+    split_numerator_col = "s_split_date_numerator"
+    split_denominator_col = "s_split_date_denominator"
+
+    # Define explicit price metric pairs to validate
+    price_pairs = [
+        ("m_open", "m_open_split_adjusted"),
+        ("m_high", "m_high_split_adjusted"),
+        ("m_low", "m_low_split_adjusted"),
+        ("m_close", "m_close_split_adjusted"),
+        ("m_vwap", "m_vwap_split_adjusted"),
+    ]
+
+    # Define volume pair (inverse relationship)
+    volume_pair = ("m_volume", "m_volume_split_adjusted")
+
+    # Filter pairs based on columns parameter - only validate columns that are requested
+    columns_set = set(columns) if columns and columns != [""] else schema_cols
+
+    # Check which pairs are available and requested
+    available_price_pairs = [
+        (raw, adj) for raw, adj in price_pairs
+        if raw in schema_cols and adj in schema_cols
+        and (raw in columns_set or adj in columns_set or columns == [""])
+    ]
+
+    has_volume_pair = (
+        volume_pair[0] in schema_cols and
+        volume_pair[1] in schema_cols and
+        (volume_pair[0] in columns_set or volume_pair[1] in columns_set or columns == [""])
+    )
+
+    has_split_cols = (
+        split_numerator_col in schema_cols and
+        split_denominator_col in schema_cols
+    )
+
+    # If no split columns or no pairs to validate, return early
+    if not has_split_cols or (not available_price_pairs and not has_volume_pair):
+        error_log["soft_filter_warnings"].append({
+            "ticker": ticker,
+            "warning_type": "missing_columns",
+            "message": "Required split columns or price/volume pairs not found in dataset",
+            "has_split_cols": has_split_cols,
+            "available_price_pairs": len(available_price_pairs),
+            "has_volume_pair": has_volume_pair
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, error_log)
+
+    # ==================== STEP 1: Calculate Daily Event Factor ====================
+    # factor = denominator / numerator
+    # If numerator or denominator is 0 or Null, factor = 1.0 (no split event)
+    daily_factor_expr = (
+        polars.when(
+            (polars.col(split_numerator_col).is_null()) |
+            (polars.col(split_denominator_col).is_null()) |
+            (polars.col(split_numerator_col) == 0) |
+            (polars.col(split_denominator_col) == 0)
+        )
+        .then(polars.lit(1.0))
+        .otherwise(
+            polars.col(split_denominator_col) / polars.col(split_numerator_col)
+        )
+    ).alias("_daily_factor")
+
+    # ==================== STEP 2: Calculate Cumulative K (K_expected) ====================
+    # K_expected = cumulative product of daily factors
+    # We use log-sum-exp approach for numerical stability: K = exp(sum(log(factor)))
+    cumulative_k_expr = (
+        polars.col("_daily_factor").log().cum_sum().exp()
+    ).alias("_k_expected")
+
+    # Add the computed columns
+    working_lf = working_lf.with_columns([daily_factor_expr])
+    working_lf = working_lf.with_columns([cumulative_k_expr])
+
+    # ==================== STEP 3 & 4: Validate Price and Volume Columns ====================
+    # Build validation expressions for all pairs
+    violation_exprs = []
+    correction_exprs = []
+    violation_info = []
+    columns_for_logging = {date_col, "_k_expected", "_daily_factor"}
+
+    # Process price pairs
+    for raw_col, adj_col in available_price_pairs:
+        columns_for_logging.update([raw_col, adj_col])
+
+        # K_implied = adjusted / raw (for prices)
+        k_implied_name = f"_k_implied_{raw_col}"
+        k_implied_expr = (
+            polars.when(
+                (polars.col(raw_col).is_null()) |
+                (polars.col(raw_col) == 0)
+            )
+            .then(polars.lit(None))
+            .otherwise(polars.col(adj_col) / polars.col(raw_col))
+        ).alias(k_implied_name)
+
+        # Violation check: |K_implied - K_expected| > tolerance * |K_expected|
+        # Also check that both raw and adjusted are valid (not null/zero)
+        violation_name = f"_viol_{raw_col}"
+        violation_expr = (
+            polars.col(raw_col).is_not_null() &
+            (polars.col(raw_col) != 0) &
+            polars.col(adj_col).is_not_null() &
+            (
+                (polars.col(k_implied_name) - polars.col("_k_expected")).abs() >
+                (polars.col("_k_expected").abs() * tolerance)
+            )
+        ).alias(violation_name)
+
+        # Correction: recalculate adjusted = raw * K_expected
+        corrected_adj_expr = (
+            polars.when(polars.col(violation_name))
+            .then(polars.col(raw_col) * polars.col("_k_expected"))
+            .otherwise(polars.col(adj_col))
+        ).alias(adj_col)
+
+        violation_exprs.append(k_implied_expr)
+        violation_exprs.append(violation_expr)
+        correction_exprs.append(corrected_adj_expr)
+
+        violation_info.append({
+            "flag": violation_name,
+            "k_implied_col": k_implied_name,
+            "error_type": "price_split_mismatch",
+            "raw_col": raw_col,
+            "adj_col": adj_col,
+            "relationship": "price"
+        })
+
+    # Process volume pair (inverse relationship)
+    if has_volume_pair:
+        raw_col, adj_col = volume_pair
+        columns_for_logging.update([raw_col, adj_col])
+
+        # K_implied = raw / adjusted (for volume - inverse relationship)
+        k_implied_name = f"_k_implied_{raw_col}"
+        k_implied_expr = (
+            polars.when(
+                (polars.col(adj_col).is_null()) |
+                (polars.col(adj_col) == 0)
+            )
+            .then(polars.lit(None))
+            .otherwise(polars.col(raw_col) / polars.col(adj_col))
+        ).alias(k_implied_name)
+
+        # Violation check
+        violation_name = f"_viol_{raw_col}"
+        violation_expr = (
+            polars.col(adj_col).is_not_null() &
+            (polars.col(adj_col) != 0) &
+            polars.col(raw_col).is_not_null() &
+            (
+                (polars.col(k_implied_name) - polars.col("_k_expected")).abs() >
+                (polars.col("_k_expected").abs() * tolerance)
+            )
+        ).alias(violation_name)
+
+        # Correction: recalculate adjusted = raw / K_expected
+        corrected_adj_expr = (
+            polars.when(polars.col(violation_name))
+            .then(
+                polars.when(polars.col("_k_expected") != 0)
+                .then(polars.col(raw_col) / polars.col("_k_expected"))
+                .otherwise(polars.col(adj_col))
+            )
+            .otherwise(polars.col(adj_col))
+        ).alias(adj_col)
+
+        violation_exprs.append(k_implied_expr)
+        violation_exprs.append(violation_expr)
+        correction_exprs.append(corrected_adj_expr)
+
+        violation_info.append({
+            "flag": violation_name,
+            "k_implied_col": k_implied_name,
+            "error_type": "volume_split_mismatch",
+            "raw_col": raw_col,
+            "adj_col": adj_col,
+            "relationship": "volume"
+        })
+
+    # Apply violation expressions
+    working_lf = working_lf.with_columns(violation_exprs)
+
+    # ==================== STEP 5: Log Violations and Apply Corrections ====================
+    if violation_info:
+        # Create any_violation expression
+        violation_flags = [polars.col(info["flag"]) for info in violation_info]
+        any_violation = polars.any_horizontal(*violation_flags)
+
+        # Collect error rows for logging
+        logging_cols = list(columns_for_logging)
+        k_implied_cols = [info["k_implied_col"] for info in violation_info]
+        flag_cols = [info["flag"] for info in violation_info]
+
+        error_rows_df = (
+            working_lf
+            .select(logging_cols + k_implied_cols + flag_cols)
+            .filter(any_violation)
+            .collect()
+        )
+
+        if not error_rows_df.is_empty():
+            error_rows = error_rows_df.to_dicts()
+
+            for row in error_rows:
+                for info in violation_info:
+                    if not row.get(info["flag"]):
+                        continue
+
+                    raw_col = info["raw_col"]
+                    adj_col = info["adj_col"]
+                    k_implied_col = info["k_implied_col"]
+
+                    raw_val = row.get(raw_col)
+                    adj_val = row.get(adj_col)
+                    k_implied = row.get(k_implied_col)
+                    k_expected = row.get("_k_expected")
+                    daily_factor = row.get("_daily_factor")
+
+                    # Calculate corrected value
+                    if info["relationship"] == "price":
+                        corrected_val = raw_val * k_expected if raw_val is not None else None
+                    else:  # volume
+                        corrected_val = raw_val / k_expected if (raw_val is not None and k_expected != 0) else None
+
+                    error_entry = {
+                        "ticker": ticker,
+                        "date": row.get(date_col),
+                        "error_type": info["error_type"],
+                        "raw_column": raw_col,
+                        "adjusted_column": adj_col,
+                        "raw_value": raw_val,
+                        "original_adjusted_value": adj_val,
+                        "corrected_adjusted_value": corrected_val,
+                        "k_expected": k_expected,
+                        "k_implied": k_implied,
+                        "daily_split_factor": daily_factor,
+                        "deviation": abs(k_implied - k_expected) if (k_implied is not None and k_expected is not None) else None,
+                        "tolerance": tolerance,
+                        "correction_method": "recalculated_from_k_expected"
+                    }
+
+                    error_log["hard_filter_errors"].append(error_entry)
+
+        # Apply corrections
+        working_lf = working_lf.with_columns(correction_exprs)
+
+    # ==================== CLEANUP: Remove Temporary Columns ====================
+    temp_cols_to_drop = ["_daily_factor", "_k_expected"]
+    temp_cols_to_drop.extend([info["k_implied_col"] for info in violation_info])
+    temp_cols_to_drop.extend([info["flag"] for info in violation_info])
+
+    working_lf = working_lf.drop(temp_cols_to_drop)
+
+    # Return in the same format as input
+    result_df = working_lf if is_lazy else working_lf.collect()
+
+    return (result_df, error_log)
+
