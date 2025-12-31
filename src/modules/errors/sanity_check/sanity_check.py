@@ -15,11 +15,6 @@ def sort_dates(
     """
     Sort a polars DataFrame or LazyFrame by date columns with a defined hierarchy.
 
-    Sorting hierarchy (highest to lowest priority):
-    1. f_filing_date
-    2. f_accepted_date
-    3. date_col (default: m_date)
-
     Args:
         df: The polars DataFrame or LazyFrame to sort.
         ticker: The ticker symbol for logging/tracking purposes.
@@ -36,9 +31,8 @@ def sort_dates(
             - A list of dicts documenting order mismatches and removed duplicates
     """
     date_hierarchy = [
-        "f_filing_date",
-        "f_accepted_date",
         date_col,
+        "f_filing_date",
     ]
 
     sort_columns = [col for col in date_hierarchy if col in columns]

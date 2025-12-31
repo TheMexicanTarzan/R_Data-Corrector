@@ -1,6 +1,6 @@
-
 from pathlib import Path
 import logging
+import polars
 
 from src.input_handlers.csv_reader import read_csv_files_to_polars
 from src.modules.errors.sanity_check.sanity_check import (
@@ -14,7 +14,7 @@ from src.modules.errors.sanity_check.sanity_check import (
     validate_market_split_consistency
 )
 from src.features.lazy_parallelization import parallel_process_tickers
-
+from src.dashboard.dashboard import run_dashboard
 
 current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
@@ -23,7 +23,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    dataframe_dict = read_csv_files_to_polars(data_directory, max_files= 500)
+    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=500)
+
+    # Store original dataframes for comparison (deep copy before any modifications)
+    original_dataframe_dict = {}
+    for ticker, df in dataframe_dict.items():
+        # Collect LazyFrames for the copy, then store
+        if isinstance(df, polars.LazyFrame):
+            original_dataframe_dict[ticker] = df.collect().clone()
+        else:
+            original_dataframe_dict[ticker] = df.clone()
+
 
     def run_full_sanity_check():
         date_cols = [
@@ -47,7 +57,7 @@ if __name__ == "__main__":
             "fis_revenues"
         ]
 
-        market_negatives_columns = columns = [
+        market_negatives_columns = [
             "m_open",
             "m_high",
             "m_low",
@@ -161,7 +171,16 @@ if __name__ == "__main__":
         }
         return dataframe_dict_clean_split_consistency, logs_sanity_check
 
+
     clean_dfs, logs = run_full_sanity_check()
 
-print("done")
+    print("Data cleaning complete. Launching dashboard...")
 
+    # Launch the dashboard with original and cleaned data
+    run_dashboard(
+        original_dataframes=original_dataframe_dict,
+        cleaned_dataframes=clean_dfs,
+        logs=logs,
+        debug=True,
+        port=8050
+    )
