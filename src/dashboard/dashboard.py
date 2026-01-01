@@ -21,6 +21,41 @@ import logging
 # LOG NORMALIZATION FUNCTIONS
 # ============================================================================
 
+def make_json_serializable(obj: Any) -> Any:
+    """
+    Convert an object to a JSON-serializable format.
+
+    Handles date, datetime, and other non-serializable types.
+    """
+    from datetime import date, datetime
+    import numpy as np
+
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    elif isinstance(obj, (np.integer, np.floating)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif obj is None or (isinstance(obj, float) and np.isnan(obj)):
+        return None
+    elif isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_serializable(item) for item in obj]
+    else:
+        return obj
+
+
+def safe_json_dumps(obj: Any) -> str:
+    """Safely serialize an object to JSON, handling non-serializable types."""
+    try:
+        serializable_obj = make_json_serializable(obj)
+        return json.dumps(serializable_obj)
+    except Exception as e:
+        # Fallback: return string representation
+        return json.dumps({"error": f"Could not serialize: {str(e)}", "repr": str(obj)})
+
+
 def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     """
     Normalize all error logs into a unified Polars DataFrame structure.
@@ -85,7 +120,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get("original_position")),
                             "corrected_value": str(entry.get("sorted_position")),
                             "message": f"Row moved from position {entry.get('original_position')} to {entry.get('sorted_position')}",
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
                     elif error_type == "duplicates_removed":
                         normalized_records.append({
@@ -97,7 +132,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get("duplicates_removed")),
                             "corrected_value": "0",
                             "message": f"{entry.get('duplicates_removed')} duplicates removed using {entry.get('strategy')} strategy",
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
                     elif error_type == "no_date_columns":
                         normalized_records.append({
@@ -109,7 +144,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": None,
                             "corrected_value": None,
                             "message": "No date columns found for sorting",
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
 
     # 2. Process negative_fundamentals_logs (list of dicts from parallel_process_tickers)
@@ -134,7 +169,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get(column)),
                             "corrected_value": "forward_filled",
                             "message": f"Negative value {entry.get(column)} in {column} replaced via forward fill",
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
 
     # 3. Process negative_market_logs (list of lists from parallel_process_tickers)
@@ -157,7 +192,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         "original_value": str(entry.get("original_value")),
                         "corrected_value": str(entry.get("corrected_value")),
                         "message": f"Negative value corrected using {method}",
-                        "metadata": json.dumps(entry)
+                        "metadata": safe_json_dumps(entry)
                     })
 
     # 4. Process zero_wipeout_logs (list of lists from parallel_process_tickers)
@@ -185,7 +220,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         "original_value": "0",
                         "corrected_value": "forward_filled",
                         "message": f"Zero values found with volume {entry.get('m_volume')}, replaced via forward fill",
-                        "metadata": json.dumps(entry)
+                        "metadata": safe_json_dumps(entry)
                     })
     
     # 5. Process shares_outstanding_logs (list of lists from parallel_process_tickers)
@@ -211,7 +246,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         "original_value": str(entry.get(columns_involved[0]) if columns_involved else None),
                         "corrected_value": "forward_filled",
                         "message": f"10x scale jump detected and corrected",
-                        "metadata": json.dumps(entry)
+                        "metadata": safe_json_dumps(entry)
                     })
     
     # 6. Process ohlc_logs (list of lists from parallel_process_tickers)
@@ -236,7 +271,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get("old_high")),
                             "corrected_value": str(entry.get("new_high")),
                             "message": entry.get("message", "High corrected to maximum"),
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
                     elif error_type == "low_not_minimum":
                         normalized_records.append({
@@ -248,7 +283,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get("old_low")),
                             "corrected_value": str(entry.get("new_low")),
                             "message": entry.get("message", "Low corrected to minimum"),
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
                     elif error_type == "vwap_outside_range":
                         normalized_records.append({
@@ -260,7 +295,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get("old_vwap")),
                             "corrected_value": str(entry.get("new_vwap")),
                             "message": entry.get("message", "VWAP corrected to OHLC centroid"),
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
     
     # 7. Process financial_unequivalencies_logs (list of nested dicts from parallel_process_tickers)
@@ -288,7 +323,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                                 "original_value": f"Current: {entry.get('current')}, Noncurrent: {entry.get('noncurrent')}",
                                 "corrected_value": f"Current: {entry.get('corrected_current')}, Noncurrent: {entry.get('corrected_noncurrent')}",
                                 "message": f"Assets mismatch corrected using {entry.get('correction_method')} (diff: {entry.get('difference')})",
-                                "metadata": json.dumps(entry)
+                                "metadata": safe_json_dumps(entry)
                             })
                         elif error_type == "liabilities_mismatch":
                             normalized_records.append({
@@ -300,7 +335,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                                 "original_value": f"Current: {entry.get('current')}, Noncurrent: {entry.get('noncurrent')}",
                                 "corrected_value": f"Current: {entry.get('corrected_current')}, Noncurrent: {entry.get('corrected_noncurrent')}",
                                 "message": f"Liabilities mismatch corrected using {entry.get('correction_method')} (diff: {entry.get('difference')})",
-                                "metadata": json.dumps(entry)
+                                "metadata": safe_json_dumps(entry)
                             })
     
                 # Soft filter warnings (flags only)
@@ -318,7 +353,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                                 "original_value": f"Total: {entry.get('total')}",
                                 "corrected_value": "Not applicable",
                                 "message": f"Equity mismatch flagged (diff: {entry.get('difference')})",
-                                "metadata": json.dumps(entry)
+                                "metadata": safe_json_dumps(entry)
                             })
                         elif error_type == "accounting_equation_mismatch":
                             normalized_records.append({
@@ -330,7 +365,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                                 "original_value": f"Assets: {entry.get('assets (total)')}",
                                 "corrected_value": "Not applicable",
                                 "message": f"A ≠ L + E + NCI (diff: {entry.get('difference')})",
-                                "metadata": json.dumps(entry)
+                                "metadata": safe_json_dumps(entry)
                             })
                         elif error_type == "cash_mismatch":
                             normalized_records.append({
@@ -342,7 +377,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                                 "original_value": f"{list(entry.keys())[3]}: {list(entry.values())[3]}",
                                 "corrected_value": "Not applicable",
                                 "message": f"Cash equivalency mismatch flagged (diff: {entry.get('difference')})",
-                                "metadata": json.dumps(entry)
+                                "metadata": safe_json_dumps(entry)
                             })
     
     # 8. Process split_inconsistencies_logs (list of lists from parallel_process_tickers)
@@ -367,7 +402,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get("original_adjusted_value")),
                             "corrected_value": str(entry.get("corrected_adjusted_value")),
                             "message": f"Split-adjusted price corrected (K_expected: {entry.get('k_expected')}, K_implied: {entry.get('k_implied')})",
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
                     elif error_type == "volume_split_mismatch":
                         normalized_records.append({
@@ -379,7 +414,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "original_value": str(entry.get("original_adjusted_value")),
                             "corrected_value": str(entry.get("corrected_adjusted_value")),
                             "message": f"Split-adjusted volume corrected (K_expected: {entry.get('k_expected')}, K_implied: {entry.get('k_implied')})",
-                            "metadata": json.dumps(entry)
+                            "metadata": safe_json_dumps(entry)
                         })
                     elif error_type in ["skipped_pair", "skipped_validation"]:
                         # These are informational, can be included or filtered
