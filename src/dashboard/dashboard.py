@@ -56,6 +56,26 @@ def safe_json_dumps(obj: Any) -> str:
         return json.dumps({"error": f"Could not serialize: {str(e)}", "repr": str(obj)})
 
 
+def safe_date_to_string(date_obj: Any) -> Optional[str]:
+    """
+    Convert a date object to ISO format string.
+
+    Handles date, datetime, string, and None values.
+    """
+    from datetime import date, datetime
+
+    if date_obj is None:
+        return None
+    elif isinstance(date_obj, datetime):
+        return date_obj.date().isoformat()
+    elif isinstance(date_obj, date):
+        return date_obj.isoformat()
+    elif isinstance(date_obj, str):
+        return date_obj
+    else:
+        return str(date_obj)
+
+
 def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     """
     Normalize all error logs into a unified Polars DataFrame structure.
@@ -113,7 +133,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     if error_type == "order_mismatch":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": entry.get("m_date") or entry.get("f_filing_date"),
+                            "date": safe_date_to_string(entry.get("m_date") or entry.get("f_filing_date")),
                             "error_category": "Date Sorting",
                             "error_type": "order_mismatch",
                             "column": "date_order",
@@ -125,7 +145,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     elif error_type == "duplicates_removed":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": None,
+                            "date": safe_date_to_string(None),
                             "error_category": "Date Sorting",
                             "error_type": "duplicates_removed",
                             "column": "date",
@@ -137,7 +157,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     elif error_type == "no_date_columns":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": None,
+                            "date": safe_date_to_string(None),
                             "error_category": "Date Sorting",
                             "error_type": "no_date_columns",
                             "column": "date",
@@ -162,7 +182,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     for entry in entries:
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": entry.get("m_date"),
+                            "date": safe_date_to_string(entry.get("m_date")),
                             "error_category": "Negative Fundamentals",
                             "error_type": "negative_value",
                             "column": column,
@@ -185,7 +205,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     method = entry.get("method", "unknown")
                     normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                        "date": entry.get("date"),
+                        "date": safe_date_to_string(entry.get("date")),
                         "error_category": "Negative Market Data",
                         "error_type": "negative_value",
                         "column": entry.get("column"),
@@ -213,7 +233,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     
                     normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                        "date": entry.get("m_date"),
+                        "date": safe_date_to_string(entry.get("m_date")),
                         "error_category": "Zero Wipeout",
                         "error_type": "zero_with_volume",
                         "column": ", ".join(zero_cols) if zero_cols else "shares",
@@ -239,7 +259,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     
                     normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                        "date": entry.get("m_date"),
+                        "date": safe_date_to_string(entry.get("m_date")),
                         "error_category": "Market Cap Scale",
                         "error_type": entry.get("error_type", "scale_10x_jump"),
                         "column": ", ".join(columns_involved),
@@ -264,7 +284,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     if error_type == "high_not_maximum":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": entry.get("date"),
+                            "date": safe_date_to_string(entry.get("date")),
                             "error_category": "OHLC Integrity",
                             "error_type": "high_not_maximum",
                             "column": f"{entry.get('column_group', 'raw')}_high",
@@ -276,7 +296,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     elif error_type == "low_not_minimum":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": entry.get("date"),
+                            "date": safe_date_to_string(entry.get("date")),
                             "error_category": "OHLC Integrity",
                             "error_type": "low_not_minimum",
                             "column": f"{entry.get('column_group', 'raw')}_low",
@@ -288,7 +308,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     elif error_type == "vwap_outside_range":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": entry.get("date"),
+                            "date": safe_date_to_string(entry.get("date")),
                             "error_category": "OHLC Integrity",
                             "error_type": "vwap_outside_range",
                             "column": f"{entry.get('column_group', 'raw')}_vwap",
@@ -316,7 +336,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         if error_type == "assets_mismatch":
                             normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                                "date": entry.get("date"),
+                                "date": safe_date_to_string(entry.get("date")),
                                 "error_category": "Accounting Mismatch (Hard)",
                                 "error_type": "assets_mismatch",
                                 "column": "assets_components",
@@ -328,7 +348,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         elif error_type == "liabilities_mismatch":
                             normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                                "date": entry.get("date"),
+                                "date": safe_date_to_string(entry.get("date")),
                                 "error_category": "Accounting Mismatch (Hard)",
                                 "error_type": "liabilities_mismatch",
                                 "column": "liabilities_components",
@@ -346,7 +366,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         if error_type == "equity_mismatch":
                             normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                                "date": entry.get("date"),
+                                "date": safe_date_to_string(entry.get("date")),
                                 "error_category": "Accounting Mismatch (Soft)",
                                 "error_type": "equity_mismatch",
                                 "column": "stockholder_equity",
@@ -358,7 +378,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         elif error_type == "accounting_equation_mismatch":
                             normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                                "date": entry.get("date"),
+                                "date": safe_date_to_string(entry.get("date")),
                                 "error_category": "Accounting Mismatch (Soft)",
                                 "error_type": "accounting_equation_mismatch",
                                 "column": "balance_sheet",
@@ -370,7 +390,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         elif error_type == "cash_mismatch":
                             normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                                "date": entry.get("date"),
+                                "date": safe_date_to_string(entry.get("date")),
                                 "error_category": "Accounting Mismatch (Soft)",
                                 "error_type": "cash_mismatch",
                                 "column": "cash_equivalents",
@@ -395,7 +415,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     if error_type == "price_split_mismatch":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": entry.get("date"),
+                            "date": safe_date_to_string(entry.get("date")),
                             "error_category": "Split Consistency",
                             "error_type": "price_split_mismatch",
                             "column": entry.get("raw_column"),
@@ -407,7 +427,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                     elif error_type == "volume_split_mismatch":
                         normalized_records.append({
                             "ticker": entry.get("ticker", "UNKNOWN"),
-                            "date": entry.get("date"),
+                            "date": safe_date_to_string(entry.get("date")),
                             "error_category": "Split Consistency",
                             "error_type": "volume_split_mismatch",
                             "column": entry.get("raw_column"),
