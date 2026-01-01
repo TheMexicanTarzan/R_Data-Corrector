@@ -59,22 +59,25 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                 print(f"  First item type: {type(value[0])}")
     print("="*40 + "\n")
 
-    # 1. Process unsorted_dates_logs (dict of {ticker: list} or direct list)
+    # 1. Process unsorted_dates_logs (list of lists from parallel_process_tickers)
     if "unsorted_dates_logs" in logs_dict:
         unsorted_logs = logs_dict["unsorted_dates_logs"]
 
-        # Handle both dict of {ticker: logs} and direct dict structure
-        if isinstance(unsorted_logs, dict):
-            # Dict of {ticker: log_list}
-            for ticker, log_list in unsorted_logs.items():
-                if not log_list:
+        # Handle list of log lists (one per ticker)
+        if isinstance(unsorted_logs, list):
+            for log_list in unsorted_logs:
+                if not log_list or not isinstance(log_list, list):
                     continue
                 for entry in log_list:
+                    if not isinstance(entry, dict):
+                        continue
+
+                    ticker = entry.get("ticker", "UNKNOWN")
                     error_type = entry.get("error_type", "unknown")
 
                     if error_type == "order_mismatch":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": entry.get("m_date") or entry.get("f_filing_date"),
                             "error_category": "Date Sorting",
                             "error_type": "order_mismatch",
@@ -86,7 +89,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         })
                     elif error_type == "duplicates_removed":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": None,
                             "error_category": "Date Sorting",
                             "error_type": "duplicates_removed",
@@ -98,7 +101,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         })
                     elif error_type == "no_date_columns":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": None,
                             "error_category": "Date Sorting",
                             "error_type": "no_date_columns",
@@ -109,11 +112,13 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "metadata": json.dumps(entry)
                         })
 
-    # 2. Process negative_fundamentals_logs (dict of lists, keyed by column)
+    # 2. Process negative_fundamentals_logs (list of dicts from parallel_process_tickers)
     if "negative_fundamentals_logs" in logs_dict:
         neg_fund_logs = logs_dict["negative_fundamentals_logs"]
-        if isinstance(neg_fund_logs, dict):
-            for ticker, col_dict in neg_fund_logs.items():
+        if isinstance(neg_fund_logs, list):
+            for col_dict in neg_fund_logs:
+                if not col_dict or not isinstance(col_dict, dict):
+                    continue
                 if not col_dict:
                     continue
                 for column, entries in col_dict.items():
@@ -121,7 +126,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         continue
                     for entry in entries:
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": entry.get("m_date"),
                             "error_category": "Negative Fundamentals",
                             "error_type": "negative_value",
@@ -132,17 +137,19 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "metadata": json.dumps(entry)
                         })
 
-    # 3. Process negative_market_logs (list of dicts)
+    # 3. Process negative_market_logs (list of lists from parallel_process_tickers)
     if "negative_market_logs" in logs_dict:
         neg_mkt_logs = logs_dict["negative_market_logs"]
-        if isinstance(neg_mkt_logs, dict):
-            for ticker, log_list in neg_mkt_logs.items():
+        if isinstance(neg_mkt_logs, list):
+            for log_list in neg_mkt_logs:
+                if not log_list or not isinstance(log_list, list):
+                    continue
                 if not log_list:
                     continue
                 for entry in log_list:
                     method = entry.get("method", "unknown")
                     normalized_records.append({
-                        "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                         "date": entry.get("date"),
                         "error_category": "Negative Market Data",
                         "error_type": "negative_value",
@@ -153,11 +160,13 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         "metadata": json.dumps(entry)
                     })
 
-    # 4. Process zero_wipeout_logs (list of dicts)
+    # 4. Process zero_wipeout_logs (list of lists from parallel_process_tickers)
     if "zero_wipeout_logs" in logs_dict:
         zero_logs = logs_dict["zero_wipeout_logs"]
-        if isinstance(zero_logs, dict):
-            for ticker, log_list in zero_logs.items():
+        if isinstance(zero_logs, list):
+            for log_list in zero_logs:
+                if not log_list or not isinstance(log_list, list):
+                    continue
                 if not log_list:
                     continue
                 for entry in log_list:
@@ -168,7 +177,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             zero_cols.append(key)
     
                     normalized_records.append({
-                        "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                         "date": entry.get("m_date"),
                         "error_category": "Zero Wipeout",
                         "error_type": "zero_with_volume",
@@ -179,11 +188,13 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         "metadata": json.dumps(entry)
                     })
     
-    # 5. Process shares_outstanding_logs (scale errors)
+    # 5. Process shares_outstanding_logs (list of lists from parallel_process_tickers)
     if "shares_outstanding_logs" in logs_dict:
         shares_logs = logs_dict["shares_outstanding_logs"]
-        if isinstance(shares_logs, dict):
-            for ticker, log_list in shares_logs.items():
+        if isinstance(shares_logs, list):
+            for log_list in shares_logs:
+                if not log_list or not isinstance(log_list, list):
+                    continue
                 if not log_list:
                     continue
                 for entry in log_list:
@@ -192,7 +203,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                                        if k not in ["ticker", "m_date", "error_type"]]
     
                     normalized_records.append({
-                        "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                         "date": entry.get("m_date"),
                         "error_category": "Market Cap Scale",
                         "error_type": entry.get("error_type", "scale_10x_jump"),
@@ -203,11 +214,13 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         "metadata": json.dumps(entry)
                     })
     
-    # 6. Process ohlc_logs (OHLC integrity violations)
+    # 6. Process ohlc_logs (list of lists from parallel_process_tickers)
     if "ohlc_logs" in logs_dict:
         ohlc_logs_data = logs_dict["ohlc_logs"]
-        if isinstance(ohlc_logs_data, dict):
-            for ticker, log_list in ohlc_logs_data.items():
+        if isinstance(ohlc_logs_data, list):
+            for log_list in ohlc_logs_data:
+                if not log_list or not isinstance(log_list, list):
+                    continue
                 if not log_list:
                     continue
                 for entry in log_list:
@@ -215,7 +228,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     
                     if error_type == "high_not_maximum":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": entry.get("date"),
                             "error_category": "OHLC Integrity",
                             "error_type": "high_not_maximum",
@@ -227,7 +240,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         })
                     elif error_type == "low_not_minimum":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": entry.get("date"),
                             "error_category": "OHLC Integrity",
                             "error_type": "low_not_minimum",
@@ -239,7 +252,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         })
                     elif error_type == "vwap_outside_range":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": entry.get("date"),
                             "error_category": "OHLC Integrity",
                             "error_type": "vwap_outside_range",
@@ -250,11 +263,13 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             "metadata": json.dumps(entry)
                         })
     
-    # 7. Process financial_unequivalencies_logs (nested dict structure)
+    # 7. Process financial_unequivalencies_logs (list of nested dicts from parallel_process_tickers)
     if "financial_unequivalencies_logs" in logs_dict:
         fin_logs = logs_dict["financial_unequivalencies_logs"]
-        if isinstance(fin_logs, dict):
-            for ticker, nested_dict in fin_logs.items():
+        if isinstance(fin_logs, list):
+            for nested_dict in fin_logs:
+                if not nested_dict or not isinstance(nested_dict, dict):
+                    continue
                 if not nested_dict:
                     continue
     
@@ -265,7 +280,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     
                         if error_type == "assets_mismatch":
                             normalized_records.append({
-                                "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                                 "date": entry.get("date"),
                                 "error_category": "Accounting Mismatch (Hard)",
                                 "error_type": "assets_mismatch",
@@ -277,7 +292,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             })
                         elif error_type == "liabilities_mismatch":
                             normalized_records.append({
-                                "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                                 "date": entry.get("date"),
                                 "error_category": "Accounting Mismatch (Hard)",
                                 "error_type": "liabilities_mismatch",
@@ -295,7 +310,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     
                         if error_type == "equity_mismatch":
                             normalized_records.append({
-                                "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                                 "date": entry.get("date"),
                                 "error_category": "Accounting Mismatch (Soft)",
                                 "error_type": "equity_mismatch",
@@ -307,7 +322,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             })
                         elif error_type == "accounting_equation_mismatch":
                             normalized_records.append({
-                                "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                                 "date": entry.get("date"),
                                 "error_category": "Accounting Mismatch (Soft)",
                                 "error_type": "accounting_equation_mismatch",
@@ -319,7 +334,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                             })
                         elif error_type == "cash_mismatch":
                             normalized_records.append({
-                                "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                                 "date": entry.get("date"),
                                 "error_category": "Accounting Mismatch (Soft)",
                                 "error_type": "cash_mismatch",
@@ -330,11 +345,13 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                                 "metadata": json.dumps(entry)
                             })
     
-    # 8. Process split_inconsistencies_logs (list of dicts)
+    # 8. Process split_inconsistencies_logs (list of lists from parallel_process_tickers)
     if "split_inconsistencies_logs" in logs_dict:
         split_logs = logs_dict["split_inconsistencies_logs"]
-        if isinstance(split_logs, dict):
-            for ticker, log_list in split_logs.items():
+        if isinstance(split_logs, list):
+            for log_list in split_logs:
+                if not log_list or not isinstance(log_list, list):
+                    continue
                 if not log_list:
                     continue
                 for entry in log_list:
@@ -342,7 +359,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     
                     if error_type == "price_split_mismatch":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": entry.get("date"),
                             "error_category": "Split Consistency",
                             "error_type": "price_split_mismatch",
@@ -354,7 +371,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         })
                     elif error_type == "volume_split_mismatch":
                         normalized_records.append({
-                            "ticker": ticker,
+                            "ticker": entry.get("ticker", "UNKNOWN"),
                             "date": entry.get("date"),
                             "error_category": "Split Consistency",
                             "error_type": "volume_split_mismatch",
