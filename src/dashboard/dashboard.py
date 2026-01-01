@@ -1518,4 +1518,6 @@ def run_dashboard(
     print(f"Debug mode: {debug}")
     print(f"{'='*60}\n")
 
-    app.run(debug=debug, port=port)
+    # Disable reloader to prevent re-running the entire data cleaning pipeline
+    # The reloader spawns a child process that re-executes the script from the start
+    app.run(debug=debug, port=port, use_reloader=False)
