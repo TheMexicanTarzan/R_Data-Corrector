@@ -40,296 +40,315 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     """
     normalized_records = []
 
-    # 1. Process unsorted_dates_logs (list of dicts)
+    # 1. Process unsorted_dates_logs (dict of {ticker: list} or direct list)
     if "unsorted_dates_logs" in logs_dict:
-        for ticker, log_list in logs_dict["unsorted_dates_logs"].items():
-            if not log_list:
-                continue
-            for entry in log_list:
-                error_type = entry.get("error_type", "unknown")
+        unsorted_logs = logs_dict["unsorted_dates_logs"]
 
-                if error_type == "order_mismatch":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": entry.get("m_date") or entry.get("f_filing_date"),
-                        "error_category": "Date Sorting",
-                        "error_type": "order_mismatch",
-                        "column": "date_order",
-                        "original_value": str(entry.get("original_position")),
-                        "corrected_value": str(entry.get("sorted_position")),
-                        "message": f"Row moved from position {entry.get('original_position')} to {entry.get('sorted_position')}",
-                        "metadata": json.dumps(entry)
-                    })
-                elif error_type == "duplicates_removed":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": None,
-                        "error_category": "Date Sorting",
-                        "error_type": "duplicates_removed",
-                        "column": "date",
-                        "original_value": str(entry.get("duplicates_removed")),
-                        "corrected_value": "0",
-                        "message": f"{entry.get('duplicates_removed')} duplicates removed using {entry.get('strategy')} strategy",
-                        "metadata": json.dumps(entry)
-                    })
-                elif error_type == "no_date_columns":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": None,
-                        "error_category": "Date Sorting",
-                        "error_type": "no_date_columns",
-                        "column": "date",
-                        "original_value": None,
-                        "corrected_value": None,
-                        "message": "No date columns found for sorting",
-                        "metadata": json.dumps(entry)
-                    })
+        # Handle both dict of {ticker: logs} and direct dict structure
+        if isinstance(unsorted_logs, dict):
+            # Dict of {ticker: log_list}
+            for ticker, log_list in unsorted_logs.items():
+                if not log_list:
+                    continue
+                for entry in log_list:
+                    error_type = entry.get("error_type", "unknown")
+
+                    if error_type == "order_mismatch":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": entry.get("m_date") or entry.get("f_filing_date"),
+                            "error_category": "Date Sorting",
+                            "error_type": "order_mismatch",
+                            "column": "date_order",
+                            "original_value": str(entry.get("original_position")),
+                            "corrected_value": str(entry.get("sorted_position")),
+                            "message": f"Row moved from position {entry.get('original_position')} to {entry.get('sorted_position')}",
+                            "metadata": json.dumps(entry)
+                        })
+                    elif error_type == "duplicates_removed":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": None,
+                            "error_category": "Date Sorting",
+                            "error_type": "duplicates_removed",
+                            "column": "date",
+                            "original_value": str(entry.get("duplicates_removed")),
+                            "corrected_value": "0",
+                            "message": f"{entry.get('duplicates_removed')} duplicates removed using {entry.get('strategy')} strategy",
+                            "metadata": json.dumps(entry)
+                        })
+                    elif error_type == "no_date_columns":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": None,
+                            "error_category": "Date Sorting",
+                            "error_type": "no_date_columns",
+                            "column": "date",
+                            "original_value": None,
+                            "corrected_value": None,
+                            "message": "No date columns found for sorting",
+                            "metadata": json.dumps(entry)
+                        })
 
     # 2. Process negative_fundamentals_logs (dict of lists, keyed by column)
     if "negative_fundamentals_logs" in logs_dict:
-        for ticker, col_dict in logs_dict["negative_fundamentals_logs"].items():
-            if not col_dict:
-                continue
-            for column, entries in col_dict.items():
-                if not entries:
+        neg_fund_logs = logs_dict["negative_fundamentals_logs"]
+        if isinstance(neg_fund_logs, dict):
+            for ticker, col_dict in neg_fund_logs.items():
+                if not col_dict:
                     continue
-                for entry in entries:
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": entry.get("m_date"),
-                        "error_category": "Negative Fundamentals",
-                        "error_type": "negative_value",
-                        "column": column,
-                        "original_value": str(entry.get(column)),
-                        "corrected_value": "forward_filled",
-                        "message": f"Negative value {entry.get(column)} in {column} replaced via forward fill",
-                        "metadata": json.dumps(entry)
-                    })
+                for column, entries in col_dict.items():
+                    if not entries:
+                        continue
+                    for entry in entries:
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": entry.get("m_date"),
+                            "error_category": "Negative Fundamentals",
+                            "error_type": "negative_value",
+                            "column": column,
+                            "original_value": str(entry.get(column)),
+                            "corrected_value": "forward_filled",
+                            "message": f"Negative value {entry.get(column)} in {column} replaced via forward fill",
+                            "metadata": json.dumps(entry)
+                        })
 
     # 3. Process negative_market_logs (list of dicts)
     if "negative_market_logs" in logs_dict:
-        for ticker, log_list in logs_dict["negative_market_logs"].items():
-            if not log_list:
-                continue
-            for entry in log_list:
-                method = entry.get("method", "unknown")
-                normalized_records.append({
-                    "ticker": ticker,
-                    "date": entry.get("date"),
-                    "error_category": "Negative Market Data",
-                    "error_type": "negative_value",
-                    "column": entry.get("column"),
-                    "original_value": str(entry.get("original_value")),
-                    "corrected_value": str(entry.get("corrected_value")),
-                    "message": f"Negative value corrected using {method}",
-                    "metadata": json.dumps(entry)
-                })
+        neg_mkt_logs = logs_dict["negative_market_logs"]
+        if isinstance(neg_mkt_logs, dict):
+            for ticker, log_list in neg_mkt_logs.items():
+                if not log_list:
+                    continue
+                for entry in log_list:
+                    method = entry.get("method", "unknown")
+                    normalized_records.append({
+                        "ticker": ticker,
+                        "date": entry.get("date"),
+                        "error_category": "Negative Market Data",
+                        "error_type": "negative_value",
+                        "column": entry.get("column"),
+                        "original_value": str(entry.get("original_value")),
+                        "corrected_value": str(entry.get("corrected_value")),
+                        "message": f"Negative value corrected using {method}",
+                        "metadata": json.dumps(entry)
+                    })
 
     # 4. Process zero_wipeout_logs (list of dicts)
     if "zero_wipeout_logs" in logs_dict:
-        for ticker, log_list in logs_dict["zero_wipeout_logs"].items():
-            if not log_list:
-                continue
-            for entry in log_list:
-                # Extract the columns that were zero
-                zero_cols = []
-                for key, val in entry.items():
-                    if key not in ["ticker", "m_date", "m_volume"] and val == 0:
-                        zero_cols.append(key)
-
-                normalized_records.append({
-                    "ticker": ticker,
-                    "date": entry.get("m_date"),
-                    "error_category": "Zero Wipeout",
-                    "error_type": "zero_with_volume",
-                    "column": ", ".join(zero_cols) if zero_cols else "shares",
-                    "original_value": "0",
-                    "corrected_value": "forward_filled",
-                    "message": f"Zero values found with volume {entry.get('m_volume')}, replaced via forward fill",
-                    "metadata": json.dumps(entry)
-                })
-
+        zero_logs = logs_dict["zero_wipeout_logs"]
+        if isinstance(zero_logs, dict):
+            for ticker, log_list in zero_logs.items():
+                if not log_list:
+                    continue
+                for entry in log_list:
+                    # Extract the columns that were zero
+                    zero_cols = []
+                    for key, val in entry.items():
+                        if key not in ["ticker", "m_date", "m_volume"] and val == 0:
+                            zero_cols.append(key)
+    
+                    normalized_records.append({
+                        "ticker": ticker,
+                        "date": entry.get("m_date"),
+                        "error_category": "Zero Wipeout",
+                        "error_type": "zero_with_volume",
+                        "column": ", ".join(zero_cols) if zero_cols else "shares",
+                        "original_value": "0",
+                        "corrected_value": "forward_filled",
+                        "message": f"Zero values found with volume {entry.get('m_volume')}, replaced via forward fill",
+                        "metadata": json.dumps(entry)
+                    })
+    
     # 5. Process shares_outstanding_logs (scale errors)
     if "shares_outstanding_logs" in logs_dict:
-        for ticker, log_list in logs_dict["shares_outstanding_logs"].items():
-            if not log_list:
-                continue
-            for entry in log_list:
-                # Extract column that had the 10x jump
-                columns_involved = [k for k in entry.keys()
-                                   if k not in ["ticker", "m_date", "error_type"]]
-
-                normalized_records.append({
-                    "ticker": ticker,
-                    "date": entry.get("m_date"),
-                    "error_category": "Market Cap Scale",
-                    "error_type": entry.get("error_type", "scale_10x_jump"),
-                    "column": ", ".join(columns_involved),
-                    "original_value": str(entry.get(columns_involved[0]) if columns_involved else None),
-                    "corrected_value": "forward_filled",
-                    "message": f"10x scale jump detected and corrected",
-                    "metadata": json.dumps(entry)
-                })
-
+        shares_logs = logs_dict["shares_outstanding_logs"]
+        if isinstance(shares_logs, dict):
+            for ticker, log_list in shares_logs.items():
+                if not log_list:
+                    continue
+                for entry in log_list:
+                    # Extract column that had the 10x jump
+                    columns_involved = [k for k in entry.keys()
+                                       if k not in ["ticker", "m_date", "error_type"]]
+    
+                    normalized_records.append({
+                        "ticker": ticker,
+                        "date": entry.get("m_date"),
+                        "error_category": "Market Cap Scale",
+                        "error_type": entry.get("error_type", "scale_10x_jump"),
+                        "column": ", ".join(columns_involved),
+                        "original_value": str(entry.get(columns_involved[0]) if columns_involved else None),
+                        "corrected_value": "forward_filled",
+                        "message": f"10x scale jump detected and corrected",
+                        "metadata": json.dumps(entry)
+                    })
+    
     # 6. Process ohlc_logs (OHLC integrity violations)
     if "ohlc_logs" in logs_dict:
-        for ticker, log_list in logs_dict["ohlc_logs"].items():
-            if not log_list:
-                continue
-            for entry in log_list:
-                error_type = entry.get("error_type", "unknown")
-
-                if error_type == "high_not_maximum":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": entry.get("date"),
-                        "error_category": "OHLC Integrity",
-                        "error_type": "high_not_maximum",
-                        "column": f"{entry.get('column_group', 'raw')}_high",
-                        "original_value": str(entry.get("old_high")),
-                        "corrected_value": str(entry.get("new_high")),
-                        "message": entry.get("message", "High corrected to maximum"),
-                        "metadata": json.dumps(entry)
-                    })
-                elif error_type == "low_not_minimum":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": entry.get("date"),
-                        "error_category": "OHLC Integrity",
-                        "error_type": "low_not_minimum",
-                        "column": f"{entry.get('column_group', 'raw')}_low",
-                        "original_value": str(entry.get("old_low")),
-                        "corrected_value": str(entry.get("new_low")),
-                        "message": entry.get("message", "Low corrected to minimum"),
-                        "metadata": json.dumps(entry)
-                    })
-                elif error_type == "vwap_outside_range":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": entry.get("date"),
-                        "error_category": "OHLC Integrity",
-                        "error_type": "vwap_outside_range",
-                        "column": f"{entry.get('column_group', 'raw')}_vwap",
-                        "original_value": str(entry.get("old_vwap")),
-                        "corrected_value": str(entry.get("new_vwap")),
-                        "message": entry.get("message", "VWAP corrected to OHLC centroid"),
-                        "metadata": json.dumps(entry)
-                    })
-
+        ohlc_logs_data = logs_dict["ohlc_logs"]
+        if isinstance(ohlc_logs_data, dict):
+            for ticker, log_list in ohlc_logs_data.items():
+                if not log_list:
+                    continue
+                for entry in log_list:
+                    error_type = entry.get("error_type", "unknown")
+    
+                    if error_type == "high_not_maximum":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": entry.get("date"),
+                            "error_category": "OHLC Integrity",
+                            "error_type": "high_not_maximum",
+                            "column": f"{entry.get('column_group', 'raw')}_high",
+                            "original_value": str(entry.get("old_high")),
+                            "corrected_value": str(entry.get("new_high")),
+                            "message": entry.get("message", "High corrected to maximum"),
+                            "metadata": json.dumps(entry)
+                        })
+                    elif error_type == "low_not_minimum":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": entry.get("date"),
+                            "error_category": "OHLC Integrity",
+                            "error_type": "low_not_minimum",
+                            "column": f"{entry.get('column_group', 'raw')}_low",
+                            "original_value": str(entry.get("old_low")),
+                            "corrected_value": str(entry.get("new_low")),
+                            "message": entry.get("message", "Low corrected to minimum"),
+                            "metadata": json.dumps(entry)
+                        })
+                    elif error_type == "vwap_outside_range":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": entry.get("date"),
+                            "error_category": "OHLC Integrity",
+                            "error_type": "vwap_outside_range",
+                            "column": f"{entry.get('column_group', 'raw')}_vwap",
+                            "original_value": str(entry.get("old_vwap")),
+                            "corrected_value": str(entry.get("new_vwap")),
+                            "message": entry.get("message", "VWAP corrected to OHLC centroid"),
+                            "metadata": json.dumps(entry)
+                        })
+    
     # 7. Process financial_unequivalencies_logs (nested dict structure)
     if "financial_unequivalencies_logs" in logs_dict:
-        for ticker, nested_dict in logs_dict["financial_unequivalencies_logs"].items():
-            if not nested_dict:
-                continue
-
-            # Hard filter errors (corrections)
-            if "hard_filter_errors" in nested_dict:
-                for entry in nested_dict["hard_filter_errors"]:
-                    error_type = entry.get("error_type", "unknown")
-
-                    if error_type == "assets_mismatch":
-                        normalized_records.append({
-                            "ticker": ticker,
-                            "date": entry.get("date"),
-                            "error_category": "Accounting Mismatch (Hard)",
-                            "error_type": "assets_mismatch",
-                            "column": "assets_components",
-                            "original_value": f"Current: {entry.get('current')}, Noncurrent: {entry.get('noncurrent')}",
-                            "corrected_value": f"Current: {entry.get('corrected_current')}, Noncurrent: {entry.get('corrected_noncurrent')}",
-                            "message": f"Assets mismatch corrected using {entry.get('correction_method')} (diff: {entry.get('difference')})",
-                            "metadata": json.dumps(entry)
-                        })
-                    elif error_type == "liabilities_mismatch":
-                        normalized_records.append({
-                            "ticker": ticker,
-                            "date": entry.get("date"),
-                            "error_category": "Accounting Mismatch (Hard)",
-                            "error_type": "liabilities_mismatch",
-                            "column": "liabilities_components",
-                            "original_value": f"Current: {entry.get('current')}, Noncurrent: {entry.get('noncurrent')}",
-                            "corrected_value": f"Current: {entry.get('corrected_current')}, Noncurrent: {entry.get('corrected_noncurrent')}",
-                            "message": f"Liabilities mismatch corrected using {entry.get('correction_method')} (diff: {entry.get('difference')})",
-                            "metadata": json.dumps(entry)
-                        })
-
-            # Soft filter warnings (flags only)
-            if "soft_filter_warnings" in nested_dict:
-                for entry in nested_dict["soft_filter_warnings"]:
-                    error_type = entry.get("error_type", "unknown")
-
-                    if error_type == "equity_mismatch":
-                        normalized_records.append({
-                            "ticker": ticker,
-                            "date": entry.get("date"),
-                            "error_category": "Accounting Mismatch (Soft)",
-                            "error_type": "equity_mismatch",
-                            "column": "stockholder_equity",
-                            "original_value": f"Total: {entry.get('total')}",
-                            "corrected_value": "Not applicable",
-                            "message": f"Equity mismatch flagged (diff: {entry.get('difference')})",
-                            "metadata": json.dumps(entry)
-                        })
-                    elif error_type == "accounting_equation_mismatch":
-                        normalized_records.append({
-                            "ticker": ticker,
-                            "date": entry.get("date"),
-                            "error_category": "Accounting Mismatch (Soft)",
-                            "error_type": "accounting_equation_mismatch",
-                            "column": "balance_sheet",
-                            "original_value": f"Assets: {entry.get('assets (total)')}",
-                            "corrected_value": "Not applicable",
-                            "message": f"A ` L + E + NCI (diff: {entry.get('difference')})",
-                            "metadata": json.dumps(entry)
-                        })
-                    elif error_type == "cash_mismatch":
-                        normalized_records.append({
-                            "ticker": ticker,
-                            "date": entry.get("date"),
-                            "error_category": "Accounting Mismatch (Soft)",
-                            "error_type": "cash_mismatch",
-                            "column": "cash_equivalents",
-                            "original_value": f"{list(entry.keys())[3]}: {list(entry.values())[3]}",
-                            "corrected_value": "Not applicable",
-                            "message": f"Cash equivalency mismatch flagged (diff: {entry.get('difference')})",
-                            "metadata": json.dumps(entry)
-                        })
-
+        fin_logs = logs_dict["financial_unequivalencies_logs"]
+        if isinstance(fin_logs, dict):
+            for ticker, nested_dict in fin_logs.items():
+                if not nested_dict:
+                    continue
+    
+                # Hard filter errors (corrections)
+                if "hard_filter_errors" in nested_dict:
+                    for entry in nested_dict["hard_filter_errors"]:
+                        error_type = entry.get("error_type", "unknown")
+    
+                        if error_type == "assets_mismatch":
+                            normalized_records.append({
+                                "ticker": ticker,
+                                "date": entry.get("date"),
+                                "error_category": "Accounting Mismatch (Hard)",
+                                "error_type": "assets_mismatch",
+                                "column": "assets_components",
+                                "original_value": f"Current: {entry.get('current')}, Noncurrent: {entry.get('noncurrent')}",
+                                "corrected_value": f"Current: {entry.get('corrected_current')}, Noncurrent: {entry.get('corrected_noncurrent')}",
+                                "message": f"Assets mismatch corrected using {entry.get('correction_method')} (diff: {entry.get('difference')})",
+                                "metadata": json.dumps(entry)
+                            })
+                        elif error_type == "liabilities_mismatch":
+                            normalized_records.append({
+                                "ticker": ticker,
+                                "date": entry.get("date"),
+                                "error_category": "Accounting Mismatch (Hard)",
+                                "error_type": "liabilities_mismatch",
+                                "column": "liabilities_components",
+                                "original_value": f"Current: {entry.get('current')}, Noncurrent: {entry.get('noncurrent')}",
+                                "corrected_value": f"Current: {entry.get('corrected_current')}, Noncurrent: {entry.get('corrected_noncurrent')}",
+                                "message": f"Liabilities mismatch corrected using {entry.get('correction_method')} (diff: {entry.get('difference')})",
+                                "metadata": json.dumps(entry)
+                            })
+    
+                # Soft filter warnings (flags only)
+                if "soft_filter_warnings" in nested_dict:
+                    for entry in nested_dict["soft_filter_warnings"]:
+                        error_type = entry.get("error_type", "unknown")
+    
+                        if error_type == "equity_mismatch":
+                            normalized_records.append({
+                                "ticker": ticker,
+                                "date": entry.get("date"),
+                                "error_category": "Accounting Mismatch (Soft)",
+                                "error_type": "equity_mismatch",
+                                "column": "stockholder_equity",
+                                "original_value": f"Total: {entry.get('total')}",
+                                "corrected_value": "Not applicable",
+                                "message": f"Equity mismatch flagged (diff: {entry.get('difference')})",
+                                "metadata": json.dumps(entry)
+                            })
+                        elif error_type == "accounting_equation_mismatch":
+                            normalized_records.append({
+                                "ticker": ticker,
+                                "date": entry.get("date"),
+                                "error_category": "Accounting Mismatch (Soft)",
+                                "error_type": "accounting_equation_mismatch",
+                                "column": "balance_sheet",
+                                "original_value": f"Assets: {entry.get('assets (total)')}",
+                                "corrected_value": "Not applicable",
+                                "message": f"A ≠ L + E + NCI (diff: {entry.get('difference')})",
+                                "metadata": json.dumps(entry)
+                            })
+                        elif error_type == "cash_mismatch":
+                            normalized_records.append({
+                                "ticker": ticker,
+                                "date": entry.get("date"),
+                                "error_category": "Accounting Mismatch (Soft)",
+                                "error_type": "cash_mismatch",
+                                "column": "cash_equivalents",
+                                "original_value": f"{list(entry.keys())[3]}: {list(entry.values())[3]}",
+                                "corrected_value": "Not applicable",
+                                "message": f"Cash equivalency mismatch flagged (diff: {entry.get('difference')})",
+                                "metadata": json.dumps(entry)
+                            })
+    
     # 8. Process split_inconsistencies_logs (list of dicts)
     if "split_inconsistencies_logs" in logs_dict:
-        for ticker, log_list in logs_dict["split_inconsistencies_logs"].items():
-            if not log_list:
-                continue
-            for entry in log_list:
-                error_type = entry.get("error_type", "unknown")
-
-                if error_type == "price_split_mismatch":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": entry.get("date"),
-                        "error_category": "Split Consistency",
-                        "error_type": "price_split_mismatch",
-                        "column": entry.get("raw_column"),
-                        "original_value": str(entry.get("original_adjusted_value")),
-                        "corrected_value": str(entry.get("corrected_adjusted_value")),
-                        "message": f"Split-adjusted price corrected (K_expected: {entry.get('k_expected')}, K_implied: {entry.get('k_implied')})",
-                        "metadata": json.dumps(entry)
-                    })
-                elif error_type == "volume_split_mismatch":
-                    normalized_records.append({
-                        "ticker": ticker,
-                        "date": entry.get("date"),
-                        "error_category": "Split Consistency",
-                        "error_type": "volume_split_mismatch",
-                        "column": entry.get("raw_column"),
-                        "original_value": str(entry.get("original_adjusted_value")),
-                        "corrected_value": str(entry.get("corrected_adjusted_value")),
-                        "message": f"Split-adjusted volume corrected (K_expected: {entry.get('k_expected')}, K_implied: {entry.get('k_implied')})",
-                        "metadata": json.dumps(entry)
-                    })
-                elif error_type in ["skipped_pair", "skipped_validation"]:
-                    # These are informational, can be included or filtered
-                    pass
-
+        split_logs = logs_dict["split_inconsistencies_logs"]
+        if isinstance(split_logs, dict):
+            for ticker, log_list in split_logs.items():
+                if not log_list:
+                    continue
+                for entry in log_list:
+                    error_type = entry.get("error_type", "unknown")
+    
+                    if error_type == "price_split_mismatch":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": entry.get("date"),
+                            "error_category": "Split Consistency",
+                            "error_type": "price_split_mismatch",
+                            "column": entry.get("raw_column"),
+                            "original_value": str(entry.get("original_adjusted_value")),
+                            "corrected_value": str(entry.get("corrected_adjusted_value")),
+                            "message": f"Split-adjusted price corrected (K_expected: {entry.get('k_expected')}, K_implied: {entry.get('k_implied')})",
+                            "metadata": json.dumps(entry)
+                        })
+                    elif error_type == "volume_split_mismatch":
+                        normalized_records.append({
+                            "ticker": ticker,
+                            "date": entry.get("date"),
+                            "error_category": "Split Consistency",
+                            "error_type": "volume_split_mismatch",
+                            "column": entry.get("raw_column"),
+                            "original_value": str(entry.get("original_adjusted_value")),
+                            "corrected_value": str(entry.get("corrected_adjusted_value")),
+                            "message": f"Split-adjusted volume corrected (K_expected: {entry.get('k_expected')}, K_implied: {entry.get('k_implied')})",
+                            "metadata": json.dumps(entry)
+                        })
+                    elif error_type in ["skipped_pair", "skipped_validation"]:
+                        # These are informational, can be included or filtered
+                        pass
+    
     # Create Polars DataFrame
     if not normalized_records:
         # Return empty DataFrame with correct schema
