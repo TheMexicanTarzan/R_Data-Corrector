@@ -40,6 +40,25 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
     """
     normalized_records = []
 
+    # Debug: Print log structure
+    print("\n=== DEBUG: Log Structure Analysis ===")
+    for key, value in logs_dict.items():
+        print(f"\n{key}:")
+        print(f"  Type: {type(value)}")
+        if isinstance(value, dict):
+            print(f"  Keys: {list(value.keys())[:5]}...")  # First 5 keys
+            if len(value) > 0:
+                first_key = list(value.keys())[0]
+                first_value = value[first_key]
+                print(f"  First value type: {type(first_value)}")
+                if isinstance(first_value, (list, dict)):
+                    print(f"  First value length/keys: {len(first_value) if isinstance(first_value, (list, dict)) else 'N/A'}")
+        elif isinstance(value, list):
+            print(f"  Length: {len(value)}")
+            if len(value) > 0:
+                print(f"  First item type: {type(value[0])}")
+    print("="*40 + "\n")
+
     # 1. Process unsorted_dates_logs (dict of {ticker: list} or direct list)
     if "unsorted_dates_logs" in logs_dict:
         unsorted_logs = logs_dict["unsorted_dates_logs"]
