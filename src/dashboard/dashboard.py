@@ -440,7 +440,7 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
                         # These are informational, can be included or filtered
                         pass
     
-    # Create Polars DataFrame
+    # Create Polars DataFrame with explicit schema
     if not normalized_records:
         # Return empty DataFrame with correct schema
         return pl.DataFrame({
@@ -456,29 +456,34 @@ def normalize_logs(logs_dict: Dict[str, Any]) -> pl.DataFrame:
             "is_false_positive": []
         })
 
-    df = pl.DataFrame(normalized_records)
+    # Define explicit schema to avoid inference issues
+    schema = {
+        "ticker": pl.Utf8,
+        "date": pl.Utf8,  # Keep as string initially
+        "error_category": pl.Utf8,
+        "error_type": pl.Utf8,
+        "column": pl.Utf8,
+        "original_value": pl.Utf8,
+        "corrected_value": pl.Utf8,
+        "message": pl.Utf8,
+        "metadata": pl.Utf8,
+    }
+
+    df = pl.DataFrame(normalized_records, schema=schema)
 
     # Add false_positive column (default False)
     df = df.with_columns(pl.lit(False).alias("is_false_positive"))
 
-    # Ensure date column is properly typed (handle multiple date formats)
+    # Convert date column from string to date type
     if "date" in df.columns:
         try:
-            # Try standard format first
             df = df.with_columns(
-                pl.col("date").cast(pl.Utf8).str.to_date("%Y-%m-%d", strict=False).alias("date")
+                pl.col("date").str.to_date("%Y-%m-%d", strict=False).alias("date")
             )
-        except Exception:
-            try:
-                # Try alternative format
-                df = df.with_columns(
-                    pl.col("date").cast(pl.Utf8).str.to_date("%m/%d/%Y", strict=False).alias("date")
-                )
-            except Exception:
-                # Leave as string if parsing fails
-                df = df.with_columns(
-                    pl.col("date").cast(pl.Utf8).alias("date")
-                )
+        except Exception as e:
+            print(f"Warning: Could not convert date column to date type: {e}")
+            # Leave as string if conversion fails
+            pass
 
     return df
 
