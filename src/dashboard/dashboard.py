@@ -36,6 +36,9 @@ ERROR_CATEGORIES = {
 # Path for storing false positive flags
 FALSE_POSITIVES_FILE = Path(__file__).parent / "false_positives.json"
 
+# Maximum rows to display in the grid to prevent memory issues
+MAX_DISPLAY_ROWS = 500
+
 
 # ============================================================================
 # LOG NORMALIZER FUNCTIONS
@@ -934,16 +937,21 @@ def create_app(
     app.title = "Data Corrector"
     app.layout = create_layout()
 
-    # Normalize logs once
+    # Normalize logs once - keep as LazyFrame to avoid memory issues
     normalized_logs_lf = normalize_logs(logs)
-    normalized_logs_df = normalized_logs_lf.collect()
 
-    # Get unique tickers
+    # Get unique tickers (this is lightweight - just extracts ticker names)
     unique_tickers = get_unique_tickers(logs)
 
     # Load false positives into a mutable container
     # Using a dict wrapper to allow mutation in callbacks
     false_positives_container = {"data": load_false_positives()}
+
+    # Store total log count for stats (using count which is memory efficient)
+    try:
+        total_log_count = normalized_logs_lf.select(polars.len()).collect().item()
+    except Exception:
+        total_log_count = 0
 
     # ========================================================================
     # CALLBACKS
@@ -987,11 +995,11 @@ def create_app(
         filter_type: str,
     ):
         """Populate specific error dropdown based on current filters."""
-        if normalized_logs_df.is_empty():
+        if total_log_count == 0:
             return []
 
         # Start with lazy filtering
-        filtered_lf = normalized_logs_df.lazy()
+        filtered_lf = normalized_logs_lf
 
         if ticker:
             filtered_lf = filtered_lf.filter(polars.col("ticker") == ticker)
@@ -1002,35 +1010,42 @@ def create_app(
         if category == "Accounting Mismatch" and filter_type != "all":
             filtered_lf = filtered_lf.filter(polars.col("filter_type") == filter_type)
 
-        # Collect and get unique combinations
-        filtered_df = filtered_lf.collect()
-
-        if filtered_df.is_empty():
+        # Get unique values efficiently using group_by - limit to prevent memory issues
+        try:
+            unique_dates = (
+                filtered_lf.select("date")
+                .filter(polars.col("date").is_not_null() & (polars.col("date") != ""))
+                .unique()
+                .limit(100)
+                .collect()["date"].to_list()
+            )
+            unique_columns = (
+                filtered_lf.select("column_involved")
+                .filter(polars.col("column_involved").is_not_null() & (polars.col("column_involved") != ""))
+                .unique()
+                .limit(50)
+                .collect()["column_involved"].to_list()
+            )
+            unique_types = (
+                filtered_lf.select("error_type")
+                .filter(polars.col("error_type").is_not_null() & (polars.col("error_type") != ""))
+                .unique()
+                .limit(20)
+                .collect()["error_type"].to_list()
+            )
+        except Exception:
             return []
 
-        # Create options from date and column combinations
+        # Create options
         options = []
-        seen = set()
+        for date_str in sorted(unique_dates)[:100]:
+            options.append({"label": f"Date: {date_str}", "value": f"date:{date_str}"})
+        for column in sorted(unique_columns)[:50]:
+            options.append({"label": f"Column: {column}", "value": f"column:{column}"})
+        for error_type in sorted(unique_types)[:20]:
+            options.append({"label": f"Type: {error_type}", "value": f"type:{error_type}"})
 
-        for row in filtered_df.iter_rows(named=True):
-            date_str = row.get("date", "")
-            column = row.get("column_involved", "")
-            error_type = row.get("error_type", "")
-
-            # Create unique options
-            if date_str and date_str not in seen:
-                options.append({"label": f"Date: {date_str}", "value": f"date:{date_str}"})
-                seen.add(date_str)
-
-            if column and column not in seen:
-                options.append({"label": f"Column: {column}", "value": f"column:{column}"})
-                seen.add(column)
-
-            if error_type and f"type:{error_type}" not in seen:
-                options.append({"label": f"Type: {error_type}", "value": f"type:{error_type}"})
-                seen.add(f"type:{error_type}")
-
-        return sorted(options, key=lambda x: x["label"])
+        return options
 
     @app.callback(
         [
@@ -1053,11 +1068,15 @@ def create_app(
         fp_store_data: Optional[dict],
     ):
         """Update the log grid based on filters."""
-        if normalized_logs_df.is_empty():
+        if total_log_count == 0:
             return [], "No logs available"
 
+        # Require at least one filter to prevent loading too much data
+        if not ticker and not category and not specific_filters:
+            return [], f"Please select a ticker or category to view logs ({total_log_count:,} total entries)"
+
         # Start with lazy filtering
-        filtered_lf = normalized_logs_df.lazy()
+        filtered_lf = normalized_logs_lf
 
         if ticker:
             filtered_lf = filtered_lf.filter(polars.col("ticker") == ticker)
@@ -1081,11 +1100,20 @@ def create_app(
                     type_val = filter_val[5:]
                     filtered_lf = filtered_lf.filter(polars.col("error_type") == type_val)
 
-        # Collect results
-        filtered_df = filtered_lf.collect()
+        # Get count before limiting (efficiently)
+        try:
+            match_count = filtered_lf.select(polars.len()).collect().item()
+        except Exception:
+            match_count = 0
 
-        if filtered_df.is_empty():
+        if match_count == 0:
             return [], "No matching logs found"
+
+        # Collect with limit to prevent memory issues
+        try:
+            filtered_df = filtered_lf.limit(MAX_DISPLAY_ROWS).collect()
+        except Exception as e:
+            return [], f"Error loading logs: {str(e)[:100]}"
 
         # Get current false positives from store
         current_fp = fp_store_data or false_positives_container["data"]
@@ -1101,7 +1129,11 @@ def create_app(
             )
             row["is_false_positive"] = fp_key in current_fp
 
-        stats = f"Showing {len(rows)} log entries"
+        # Build stats message
+        if match_count > MAX_DISPLAY_ROWS:
+            stats = f"Showing {len(rows)} of {match_count:,} log entries"
+        else:
+            stats = f"Showing {len(rows)} log entries"
         if ticker:
             stats += f" for {ticker}"
         if category:
@@ -1313,22 +1345,29 @@ def create_app(
         # Get error dates for highlighting - filter by column if possible
         error_dates = set()
         if ticker:
-            ticker_logs = normalized_logs_df.filter(
-                polars.col("ticker") == ticker
-            )
-            if category:
-                ticker_logs = ticker_logs.filter(
-                    polars.col("error_category") == category
+            try:
+                ticker_logs_lf = normalized_logs_lf.filter(
+                    polars.col("ticker") == ticker
                 )
-            # Filter by column if applicable
-            if column:
-                ticker_logs_col = ticker_logs.filter(
-                    polars.col("column_involved").str.contains(column)
+                if category:
+                    ticker_logs_lf = ticker_logs_lf.filter(
+                        polars.col("error_category") == category
+                    )
+                # Filter by column if applicable
+                if column:
+                    ticker_logs_col_lf = ticker_logs_lf.filter(
+                        polars.col("column_involved").str.contains(column)
+                    )
+                    # Check if column filter has results
+                    col_count = ticker_logs_col_lf.select(polars.len()).collect().item()
+                    if col_count > 0:
+                        ticker_logs_lf = ticker_logs_col_lf
+                # Collect only dates column with limit
+                error_dates = set(
+                    ticker_logs_lf.select("date").limit(1000).collect()["date"].to_list()
                 )
-                # Fall back to all ticker logs if no column-specific matches
-                if ticker_logs_col.height > 0:
-                    ticker_logs = ticker_logs_col
-            error_dates = set(ticker_logs["date"].to_list())
+            except Exception:
+                error_dates = set()
 
         # Convert dates list to strings for comparison
         dates_str_list = [serialize_date(d) for d in dates]
