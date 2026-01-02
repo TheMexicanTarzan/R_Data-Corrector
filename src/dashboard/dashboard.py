@@ -48,6 +48,64 @@ def serialize_date(value: Any) -> str:
     return str(value) if value is not None else ""
 
 
+def _preprocess_parallel_logs(logs: dict) -> dict:
+    """
+    Preprocess logs from parallel_process_tickers to flatten/merge structures.
+
+    parallel_process_tickers returns logs as list[audit_log_per_ticker], so we need to:
+    - Flatten list[list[dict]] -> list[dict] for most log types
+    - Merge list[dict[str, list]] -> dict[str, list] for negative_fundamentals
+    - Merge list[dict] with hard/soft keys -> single dict for financial_unequivalencies
+    """
+    processed = {}
+
+    for log_key, log_data in logs.items():
+        if not log_data:
+            processed[log_key] = []
+            continue
+
+        # Check if this is a list of per-ticker results
+        if not isinstance(log_data, list):
+            processed[log_key] = log_data
+            continue
+
+        if log_key == "negative_fundamentals_logs":
+            # Merge list[dict[str, list[dict]]] -> dict[str, list[dict]]
+            merged = {}
+            for ticker_log in log_data:
+                if isinstance(ticker_log, dict):
+                    for col_name, entries in ticker_log.items():
+                        if col_name not in merged:
+                            merged[col_name] = []
+                        if isinstance(entries, list):
+                            merged[col_name].extend(entries)
+            processed[log_key] = merged
+
+        elif log_key == "financial_unequivalencies_logs":
+            # Merge list[dict] -> single dict with combined hard/soft lists
+            merged = {"hard_filter_errors": [], "soft_filter_warnings": []}
+            for ticker_log in log_data:
+                if isinstance(ticker_log, dict):
+                    if "hard_filter_errors" in ticker_log:
+                        merged["hard_filter_errors"].extend(ticker_log["hard_filter_errors"])
+                    if "soft_filter_warnings" in ticker_log:
+                        merged["soft_filter_warnings"].extend(ticker_log["soft_filter_warnings"])
+            processed[log_key] = merged
+
+        else:
+            # Flatten list[list[dict]] -> list[dict]
+            flattened = []
+            for ticker_log in log_data:
+                if isinstance(ticker_log, list):
+                    flattened.extend(ticker_log)
+                elif isinstance(ticker_log, dict):
+                    # Single dict entry
+                    flattened.append(ticker_log)
+            processed[log_key] = flattened
+
+    return processed
+
+
 def normalize_logs(logs: dict) -> polars.LazyFrame:
     """
     Parse all log structures into a unified Polars LazyFrame.
@@ -61,6 +119,9 @@ def normalize_logs(logs: dict) -> polars.LazyFrame:
         LazyFrame with columns: ticker, date, error_category, error_type,
         column_involved, original_value, corrected_value, message, raw_log
     """
+    # Preprocess logs from parallel processing
+    logs = _preprocess_parallel_logs(logs)
+
     normalized_rows = []
 
     # Process each log category
@@ -490,6 +551,9 @@ def _normalize_split_consistency_entry(entry: dict, category_name: str, ticker: 
 
 def get_unique_tickers(logs: dict) -> list[str]:
     """Extract unique tickers from all logs."""
+    # Preprocess logs from parallel processing first
+    logs = _preprocess_parallel_logs(logs)
+
     tickers = set()
 
     for log_key in ERROR_CATEGORIES.values():
