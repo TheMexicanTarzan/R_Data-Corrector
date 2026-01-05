@@ -14,89 +14,16 @@ from src.modules.errors.sanity_check.sanity_check import (
     validate_financial_equivalencies,
     validate_market_split_consistency
 )
-from src.features.lazy_parallelization import parallel_process_tickers
+from src.features.lazy_parallelization import parallel_process_tickers, consolidate_audit_logs
 from src.dashboard.dashboard import run_dashboard
 
 current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
 sanity_check_output_logs_directory = current_dir / ".." / "Output" / "sanity_check" / "error_logs"
+batch_size = 512
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def consolidate_audit_logs(raw_logs: list) -> dict | list:
-    """
-    Consolidate audit logs from parallel processing.
-
-    When processing multiple tickers in parallel, each ticker returns audit logs
-    (often empty [] or {}). This function flattens and merges them appropriately.
-
-    Args:
-        raw_logs: List of audit logs from parallel_process_tickers
-
-    Returns:
-        Consolidated audit logs - either a single list or dict depending on structure
-
-    Examples:
-        [[], [], []] → []
-        [[], [{"error": "..."}], []] → [{"error": "..."}]
-        [{}, {"col1": [...]}, {}] → {"col1": [...]}
-        [{"hard": [], "soft": []}, {"hard": [...], "soft": []}] → {"hard": [...], "soft": [...]}
-    """
-    if not raw_logs:
-        return []
-
-    # Check the structure of non-empty logs to determine consolidation strategy
-    sample_non_empty = None
-    for log in raw_logs:
-        if log:  # Find first non-empty log
-            sample_non_empty = log
-            break
-
-    # If all logs are empty, return appropriate empty structure
-    if sample_non_empty is None:
-        # Check if we have lists or dicts
-        has_dict = any(isinstance(log, dict) for log in raw_logs)
-        return {} if has_dict else []
-
-    # Strategy 1: List of lists → flatten to single list
-    if isinstance(sample_non_empty, list):
-        consolidated = []
-        for log in raw_logs:
-            if isinstance(log, list) and log:
-                consolidated.extend(log)
-        return consolidated
-
-    # Strategy 2: List of dicts → merge dicts
-    if isinstance(sample_non_empty, dict):
-        # Check if it's a hard/soft filter structure (financial_unequivalencies)
-        has_hard_soft = "hard_filter_errors" in sample_non_empty or "soft_filter_warnings" in sample_non_empty
-
-        if has_hard_soft:
-            # Merge hard/soft filter logs
-            consolidated = {"hard_filter_errors": [], "soft_filter_warnings": []}
-            for log in raw_logs:
-                if isinstance(log, dict):
-                    if "hard_filter_errors" in log and log["hard_filter_errors"]:
-                        consolidated["hard_filter_errors"].extend(log["hard_filter_errors"])
-                    if "soft_filter_warnings" in log and log["soft_filter_warnings"]:
-                        consolidated["soft_filter_warnings"].extend(log["soft_filter_warnings"])
-            return consolidated
-        else:
-            # Merge dict with nested lists (negative_fundamentals structure)
-            consolidated = {}
-            for log in raw_logs:
-                if isinstance(log, dict):
-                    for key, value in log.items():
-                        if key not in consolidated:
-                            consolidated[key] = []
-                        if isinstance(value, list) and value:
-                            consolidated[key].extend(value)
-            return consolidated
-
-    # Fallback: return as-is
-    return raw_logs
 
 
 if __name__ == "__main__":
@@ -190,55 +117,55 @@ if __name__ == "__main__":
             data_dict=dataframe_dict,
             columns=date_cols,
             function=sort_dates,
-            batch_size=100
+            batch_size=batch_size
         )
 
         dataframe_dict_clean_negatives_fundamentals, negative_fundamentals_logs = parallel_process_tickers(
             data_dict=dataframe_dict_sorted_dates,
             columns=fundamental_negatives_columns,
             function=fill_negatives_fundamentals,
-            batch_size=100
+            batch_size=batch_size
         )
 
         dataframe_dict_clean_negatives_market, negative_market_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_negatives_fundamentals,
             columns=market_negatives_columns,
             function=fill_negatives_market,
-            batch_size=100
+            batch_size=batch_size
         )
 
         dataframe_dict_clean_zero_wipeout, zero_wipeout_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_negatives_market,
             columns=zero_wipeout_columns,
             function=zero_wipeout,
-            batch_size=100
+            batch_size=batch_size
         )
 
         dataframe_dict_clean_10x_shares_outstanding, shares_outstanding_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_zero_wipeout,
             columns=shares_outstanding_10x_columns,
             function=mkt_cap_scale_error,
-            batch_size=100
+            batch_size=batch_size
         )
 
         dataframe_dict_clean_ohlc_integrity, ohlc_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_10x_shares_outstanding,
             columns=ohlc_integrity_columns,
             function=ohlc_integrity,
-            batch_size=100
+            batch_size=batch_size
         )
 
         dataframe_dict_clean_financial_equivalencies, financial_unequivalencies_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_ohlc_integrity,
             function=validate_financial_equivalencies,
-            batch_size=100
+            batch_size=batch_size
         )
 
         dataframe_dict_clean_split_consistency, split_inconsistencies_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_financial_equivalencies,
             columns=market_inconsistencies_columns,
             function=validate_market_split_consistency,
-            batch_size=100
+            batch_size=batch_size
         )
 
         # Consolidate audit logs to remove empty entries from parallel processing
