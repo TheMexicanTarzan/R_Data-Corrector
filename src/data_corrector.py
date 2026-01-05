@@ -1,6 +1,7 @@
 from pathlib import Path
 import logging
 import polars
+import json
 
 from src.input_handlers.csv_reader import read_csv_files_to_polars
 from src.modules.errors.sanity_check.sanity_check import (
@@ -18,6 +19,7 @@ from src.dashboard.dashboard import run_dashboard
 
 current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
+sanity_check_output_logs_directory = current_dir / ".." / "Output" / "sanity_check" / "error_logs"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -178,6 +180,9 @@ if __name__ == "__main__":
 
 
     clean_dfs, logs = run_full_sanity_check()
+
+    with open(sanity_check_output_logs_directory / 'logs_sanity_check.json', 'w') as f:
+        json.dump(logs, f, indent=4, default=str)
 
     print("Data cleaning complete. Launching dashboard...")
 
