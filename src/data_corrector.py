@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=500)
+    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=7000)
 
     # MEMORY FIX: Don't pre-collect all originals - store file paths for on-demand loading
     # The dashboard will load originals lazily when needed for visualization
@@ -113,47 +113,55 @@ if __name__ == "__main__":
             data_dict=dataframe_dict,
             columns=date_cols,
             function=sort_dates,
+            batch_size=100
         )
 
         dataframe_dict_clean_negatives_fundamentals, negative_fundamentals_logs = parallel_process_tickers(
             data_dict=dataframe_dict_sorted_dates,
             columns=fundamental_negatives_columns,
-            function=fill_negatives_fundamentals
+            function=fill_negatives_fundamentals,
+            batch_size=100
         )
 
         dataframe_dict_clean_negatives_market, negative_market_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_negatives_fundamentals,
             columns=market_negatives_columns,
             function=fill_negatives_market,
+            batch_size=100
         )
 
         dataframe_dict_clean_zero_wipeout, zero_wipeout_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_negatives_market,
             columns=zero_wipeout_columns,
-            function=zero_wipeout
+            function=zero_wipeout,
+            batch_size=100
         )
 
         dataframe_dict_clean_10x_shares_outstanding, shares_outstanding_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_zero_wipeout,
             columns=shares_outstanding_10x_columns,
-            function=mkt_cap_scale_error
+            function=mkt_cap_scale_error,
+            batch_size=100
         )
 
         dataframe_dict_clean_ohlc_integrity, ohlc_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_10x_shares_outstanding,
             columns=ohlc_integrity_columns,
-            function=ohlc_integrity
+            function=ohlc_integrity,
+            batch_size=100
         )
 
         dataframe_dict_clean_financial_equivalencies, financial_unequivalencies_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_ohlc_integrity,
             function=validate_financial_equivalencies,
+            batch_size=100
         )
 
         dataframe_dict_clean_split_consistency, split_inconsistencies_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_financial_equivalencies,
             columns=market_inconsistencies_columns,
             function=validate_market_split_consistency,
+            batch_size=100
         )
 
         logs_sanity_check = {
@@ -174,10 +182,10 @@ if __name__ == "__main__":
     print("Data cleaning complete. Launching dashboard...")
 
     # Launch the dashboard with file paths for on-demand loading (memory efficient)
-    run_dashboard(
-        original_file_paths=original_file_paths,
-        cleaned_dataframes=clean_dfs,
-        logs=logs,
-        debug=True,
-        port=8050
-    )
+    # run_dashboard(
+    #     original_file_paths=original_file_paths,
+    #     cleaned_dataframes=clean_dfs,
+    #     logs=logs,
+    #     debug=True,
+    #     port=8050
+    # )
