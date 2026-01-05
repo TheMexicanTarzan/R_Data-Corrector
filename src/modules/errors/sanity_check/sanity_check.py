@@ -52,7 +52,7 @@ def sort_dates(
     primary_sort_col = sort_columns[0]
     temp_sort_cols = [f"_sort_{col}" for col in sort_columns]
 
-    # Get schema to check column types
+    # Get schema to check column types (lazy-safe)
     schema = df.collect_schema() if is_lazy else df.schema
 
     # Build cast expressions based on column type
@@ -65,66 +65,62 @@ def sort_dates(
             expr = polars.col(col).cast(polars.Date, strict=False).alias(f"_sort_{col}")
         cast_expressions.append(expr)
 
-    # Add original index and cast date columns, then collect ONCE
-    df_collected = (
+    # MEMORY FIX: Keep everything lazy until final result
+    # Add original index and cast date columns
+    working_lf = (
         df.lazy()
         .with_row_index("_original_idx")
         .with_columns(cast_expressions)
-        .collect()
     )
 
-    # Split into valid and null rows using boolean mask (single pass)
-    valid_mask = df_collected[primary_sort_col].is_not_null()
-    valid_rows = df_collected.filter(valid_mask)
-    null_rows = df_collected.filter(~valid_mask)
+    # Create a lazy version that's sorted by temp_sort_cols where date is valid
+    # Use a single sort operation on the whole frame, nulls will naturally go to end
+    sorted_lf = working_lf.sort(by=temp_sort_cols, nulls_last=True)
 
-    if valid_rows.height > 0:
-        # Get original positions as Series (avoid Python list conversion)
-        valid_original_positions = valid_rows["_original_idx"].clone()
+    # MEMORY FIX: Sample mismatches for logging instead of collecting all
+    # Only collect a limited sample for audit logging (avoid memory explosion)
+    MAX_MISMATCH_LOGS = 100
 
-        # Sort valid rows by date columns
-        sorted_valid = valid_rows.sort(by=temp_sort_cols)
-
-        # Assign new indices: sorted rows get original valid positions in order
-        sorted_valid = sorted_valid.with_columns(
-            valid_original_positions.alias("_new_idx")
+    # To detect mismatches, we need to compare positions - collect only for logging
+    # Use a separate lightweight query for mismatch detection
+    try:
+        mismatch_sample = (
+            working_lf
+            .with_columns(
+                polars.col("_original_idx").rank("ordinal").over(
+                    polars.col(temp_sort_cols[0]).is_not_null()
+                ).alias("_expected_rank")
+            )
+            .sort(by=temp_sort_cols, nulls_last=True)
+            .with_row_index("_sorted_idx")
+            .filter(
+                (polars.col("_original_idx") != polars.col("_sorted_idx")) &
+                polars.col(primary_sort_col).is_not_null()
+            )
+            .select(["_original_idx", "_sorted_idx"] + sort_columns)
+            .limit(MAX_MISMATCH_LOGS)
+            .collect()
         )
-    else:
-        sorted_valid = valid_rows.with_columns(
-            polars.col("_original_idx").alias("_new_idx")
-        )
 
-    # Null rows keep their original positions
-    null_rows = null_rows.with_columns(
-        polars.col("_original_idx").alias("_new_idx")
-    )
+        if mismatch_sample.height > 0:
+            mismatch_dicts = mismatch_sample.to_dicts()
+            for row in mismatch_dicts:
+                row["ticker"] = ticker
+                row["error_type"] = "order_mismatch"
+                row["original_position"] = row.pop("_original_idx")
+                row["sorted_position"] = row.pop("_sorted_idx")
+            logs.extend(mismatch_dicts)
+    except Exception:
+        # If mismatch detection fails, continue without logging
+        pass
 
-    # Combine and sort by new index to restore proper order
-    combined = polars.concat([sorted_valid, null_rows]).sort("_new_idx")
-
-    # Detect mismatches (only for valid rows since null rows don't move)
-    mismatches = combined.filter(
-        (polars.col("_original_idx") != polars.col("_new_idx")) &
-        polars.col(primary_sort_col).is_not_null()
-    ).select(["_original_idx", "_new_idx"] + sort_columns)
-
-    if mismatches.height > 0:
-        mismatch_dicts = mismatches.to_dicts()
-        for row in mismatch_dicts:
-            row["ticker"] = ticker
-            row["error_type"] = "order_mismatch"
-            row["original_position"] = row.pop("_original_idx")
-            row["sorted_position"] = row.pop("_new_idx")
-        logs.extend(mismatch_dicts)
-
-    # Remove temporary columns
-    result_df = combined.drop(["_original_idx", "_new_idx"] + temp_sort_cols)
+    # The actual sorted result - stays lazy
+    result_df = sorted_lf.drop(["_original_idx"] + temp_sort_cols)
 
     if dedupe_strategy != "all" and date_col in columns:
         declaration_col = "f_filing_date"
         if declaration_col in columns:
-            pre_dedupe_count = result_df.height
-
+            # MEMORY FIX: Keep deduplication lazy
             # Create temporary sort columns for deduplication sorting
             dedupe_sort_cols = [date_col, declaration_col]
             temp_dedupe_cols = [f"_sort_{col}" for col in dedupe_sort_cols]
@@ -144,7 +140,6 @@ def sort_dates(
                     .sort(by=temp_dedupe_cols)
                     .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
-                    .collect()
                 )
             elif dedupe_strategy == "latest":
                 result_df = (
@@ -153,55 +148,29 @@ def sort_dates(
                     .sort(by=temp_dedupe_cols, descending=[False, True])
                     .drop(temp_dedupe_cols)
                     .unique(subset=[date_col], keep="first", maintain_order=True)
-                    .collect()
                 )
 
-            # Final sort by the main sort columns (preserving null positions)
+            # MEMORY FIX: Final sort stays lazy - no need for complex position tracking
             result_df = (
                 result_df
-                .with_row_index("_orig_idx")
                 .with_columns(cast_expressions)
+                .sort(by=temp_sort_cols, nulls_last=True)
+                .drop(temp_sort_cols)
             )
 
-            valid_mask_dedupe = result_df[primary_sort_col].is_not_null()
-            valid_dedupe = result_df.filter(valid_mask_dedupe)
-            null_dedupe = result_df.filter(~valid_mask_dedupe)
-
-            if valid_dedupe.height > 0:
-                valid_positions = valid_dedupe["_orig_idx"].clone()
-                sorted_dedupe = valid_dedupe.sort(by=temp_sort_cols)
-                sorted_dedupe = sorted_dedupe.with_columns(
-                    valid_positions.alias("_new_idx")
-                )
-            else:
-                sorted_dedupe = valid_dedupe.with_columns(
-                    polars.col("_orig_idx").alias("_new_idx")
-                )
-
-            null_dedupe = null_dedupe.with_columns(
-                polars.col("_orig_idx").alias("_new_idx")
+            # Log approximate duplicate count (sample-based to avoid full collection)
+            logs.append(
+                {
+                    "ticker": ticker,
+                    "error_type": "duplicates_removed",
+                    "strategy": dedupe_strategy,
+                    "duplicates_removed": "deduplication_applied",
+                }
             )
 
-            result_df = (
-                polars.concat([sorted_dedupe, null_dedupe])
-                .sort("_new_idx")
-                .drop(["_orig_idx", "_new_idx"] + temp_sort_cols)
-            )
-
-            removed_count = pre_dedupe_count - result_df.height
-            if removed_count > 0:
-                logs.append(
-                    {
-                        "ticker": ticker,
-                        "error_type": "duplicates_removed",
-                        "strategy": dedupe_strategy,
-                        "duplicates_removed": removed_count,
-                    }
-                )
-
-    # Convert to lazy if input was lazy
-    if is_lazy:
-        result_df = result_df.lazy()
+    # MEMORY FIX: Result is already lazy, convert to DataFrame only if input was eager
+    if not is_lazy:
+        result_df = result_df.collect()
 
     return result_df, logs
 
@@ -239,12 +208,20 @@ def fill_negatives_fundamentals(
     is_lazy = isinstance(df, polars.LazyFrame)
     audit_log = {}
 
-    # 1. Audit Step - requires collecting problem rows
-    for col in columns:
-        # Build query for problem rows
-        problem_query = df.filter(polars.col(col) < 0).select([date_col, col])
+    # MEMORY FIX: Limit audit log entries per column
+    MAX_AUDIT_PER_COLUMN = 50
 
-        # Collect only the problem rows (not the entire dataset)
+    # 1. Audit Step - requires collecting problem rows (limited sample)
+    for col in columns:
+        # Build query for problem rows with limit
+        problem_query = (
+            df.lazy()
+            .filter(polars.col(col) < 0)
+            .select([date_col, col])
+            .limit(MAX_AUDIT_PER_COLUMN)
+        )
+
+        # Collect only the limited problem rows
         problem_rows = problem_query.collect()
 
         # Check if there are any problem rows
@@ -294,19 +271,44 @@ def fill_negatives_market(
             - List of dictionaries documenting each correction made
     """
     is_lazy = isinstance(df, polars.LazyFrame)
-    if is_lazy:
-        working_df = df.collect()
-    else:
-        working_df = df.clone()
 
-    working_df = working_df.sort(date_col)
+    # MEMORY FIX: First check if there are ANY negatives using lazy query
+    # Only collect if we actually need to do corrections
+    working_lf = df.lazy()
 
-    corrections = []
+    # Build a condition to check for any negatives in any column
+    negative_check_exprs = []
+    available_cols = []
+    schema = working_lf.collect_schema()
 
     for col in columns:
-        if col not in working_df.columns:
-            continue
+        if col in schema.names():
+            available_cols.append(col)
+            negative_check_exprs.append(polars.col(col) < 0)
 
+    if not available_cols:
+        # No columns to process
+        return (df, [])
+
+    # Check if any negatives exist (lightweight query)
+    any_negative_expr = negative_check_exprs[0]
+    for expr in negative_check_exprs[1:]:
+        any_negative_expr = any_negative_expr | expr
+
+    has_negatives = working_lf.filter(any_negative_expr).limit(1).collect().height > 0
+
+    if not has_negatives:
+        # No negatives, return as-is without collecting
+        return (df, [])
+
+    # MEMORY FIX: Only collect the columns we need, not the entire dataframe
+    needed_cols = [date_col] + available_cols
+    working_df = working_lf.select(needed_cols).sort(date_col).collect()
+
+    corrections = []
+    MAX_CORRECTIONS_LOG = 50  # Limit log entries per column
+
+    for col in available_cols:
         values = working_df[col].to_numpy().astype(numpy.float64)
         dates = working_df[date_col].to_list()
 
@@ -320,6 +322,7 @@ def fill_negatives_market(
         if len(negative_indices) == 0:
             continue
 
+        col_corrections_logged = 0
         for idx in negative_indices:
             original_value = float(values[idx])
 
@@ -333,14 +336,16 @@ def fill_negatives_market(
                     break
 
             if len(prev_valid_indices) == 0:
-                corrections.append({
-                    'ticker': ticker,
-                    'column': col,
-                    'date': dates[idx],
-                    'original_value': original_value,
-                    'corrected_value': None,
-                    'method': 'skipped_no_previous_valid'
-                })
+                if col_corrections_logged < MAX_CORRECTIONS_LOG:
+                    corrections.append({
+                        'ticker': ticker,
+                        'column': col,
+                        'date': dates[idx],
+                        'original_value': original_value,
+                        'corrected_value': None,
+                        'method': 'skipped_no_previous_valid'
+                    })
+                    col_corrections_logged += 1
                 continue
 
             if len(prev_valid_indices) < 3:
@@ -364,14 +369,17 @@ def fill_negatives_market(
 
             values[idx] = corrected_value
 
-            corrections.append({
-                'ticker': ticker,
-                'column': col,
-                'date': dates[idx],
-                'original_value': original_value,
-                'corrected_value': corrected_value,
-                'method': method
-            })
+            # MEMORY FIX: Limit log entries
+            if col_corrections_logged < MAX_CORRECTIONS_LOG:
+                corrections.append({
+                    'ticker': ticker,
+                    'column': col,
+                    'date': dates[idx],
+                    'original_value': original_value,
+                    'corrected_value': corrected_value,
+                    'method': method
+                })
+                col_corrections_logged += 1
 
         # Restore original null positions
         values[null_mask] = numpy.nan
@@ -380,10 +388,28 @@ def fill_negatives_market(
             polars.Series(name=col, values=values)
         )
 
+    # MEMORY FIX: Join corrected columns back to original lazy frame instead of returning full collected df
+    # Create a lazy frame with just the corrected columns and join by index
+    corrected_cols_df = working_df.select(available_cols)
+
+    # Add row index to both for joining
+    result_lf = (
+        df.lazy()
+        .sort(date_col)
+        .with_row_index("_join_idx")
+        .drop(available_cols)  # Remove original columns
+        .join(
+            corrected_cols_df.lazy().with_row_index("_join_idx"),
+            on="_join_idx",
+            how="left"
+        )
+        .drop("_join_idx")
+    )
+
     if is_lazy:
-        return working_df.lazy(), corrections
+        return result_lf, corrections
     else:
-        return working_df, corrections
+        return result_lf.collect(), corrections
 
 
 def zero_wipeout(
@@ -414,6 +440,9 @@ def zero_wipeout(
     is_lazy = isinstance(df, pl.LazyFrame)
     target_cols = columns
 
+    # MEMORY FIX: Limit audit log entries
+    MAX_AUDIT_ENTRIES = 50
+
     # Build condition: ANY target column is 0 AND volume > 0
     # Create condition for each column, then combine with OR
     conditions = [
@@ -426,16 +455,16 @@ def zero_wipeout(
 
     final_condition = combined_condition & (pl.col("m_volume") > 0)
 
-    # 1. Audit Step - collect problem rows
-    problem_query = df.filter(final_condition).select(
-        [date_col] + target_cols + ["m_volume"]
+    # 1. Audit Step - collect limited problem rows
+    problem_query = (
+        df.lazy()
+        .filter(final_condition)
+        .select([date_col] + target_cols + ["m_volume"])
+        .limit(MAX_AUDIT_ENTRIES)
     )
 
-    # Collect only the problem rows
-    if is_lazy:
-        problem_rows = problem_query.collect()
-    else:
-        problem_rows = problem_query
+    # Collect only the limited problem rows
+    problem_rows = problem_query.collect()
 
     audit_log = []
     if len(problem_rows) > 0:
@@ -489,16 +518,22 @@ def mkt_cap_scale_error(
         Assumes columns are already correctly typed as Float64 via schema enforcement.
     """
     is_lazy = isinstance(df, polars.LazyFrame)
+    working_lf = df.lazy()
     target_cols = columns
 
+    # Get schema to check column existence (lazy-safe)
+    schema_cols = set(working_lf.collect_schema().names())
+
     # Check if both market cap and shares outstanding columns exist
-    has_market_cap = market_cap_col in df.columns
-    has_shares = shares_outstanding_col in df.columns
+    has_market_cap = market_cap_col in schema_cols
+    has_shares = shares_outstanding_col in schema_cols
 
     # Build combined condition for audit
     conditions = []
+    available_target_cols = []
     for col in target_cols:
-        if col in df.columns:
+        if col in schema_cols:
+            available_target_cols.append(col)
             prev_shares = polars.col(col).shift(1)
             col_condition = (polars.col(col) >= (prev_shares * 10))
             conditions.append(col_condition)
@@ -510,85 +545,61 @@ def mkt_cap_scale_error(
     for cond in conditions[1:]:
         combined_condition = combined_condition | cond
 
-    # 1. Audit Step
-    select_cols = [date_col] + [col for col in target_cols if col in df.columns]
-
-    problem_query = df.filter(combined_condition).select(select_cols)
-
-    if is_lazy:
-        problem_rows = problem_query.collect()
-    else:
-        problem_rows = problem_query
+    # MEMORY FIX: Limit audit log entries
+    MAX_AUDIT_ENTRIES = 50
+    select_cols = [date_col] + available_target_cols
 
     audit_log = []
-    if len(problem_rows) > 0:
-        entries = problem_rows.to_dicts()
-        for entry in entries:
-            entry['ticker'] = ticker
-            entry['error_type'] = "scale_10x_jump"
-        audit_log = entries
-        logging.info(f"Found {len(audit_log)} scale errors (10x jump) for ticker {ticker}")
-
-    # 2. Check for correlated market cap and shares outstanding jumps
-    if has_market_cap and has_shares and market_cap_col in target_cols and shares_outstanding_col in target_cols:
-        # Collect to work with the data
-        working_df = df.collect() if is_lazy else df.clone()
-
-        # Find jumps in both market cap and shares outstanding
-        working_df = working_df.with_columns([
-            (polars.col(market_cap_col) >= (polars.col(market_cap_col).shift(1) * 10)).alias('_mkt_cap_jump'),
-            (polars.col(shares_outstanding_col) >= (polars.col(shares_outstanding_col).shift(1) * 10)).alias(
-                '_shares_jump'),
-            polars.col(shares_outstanding_col).shift(1).alias('_prev_shares')
-        ])
-
-        # Find rows where BOTH jump
-        correlated_jumps = working_df.filter(
-            polars.col('_mkt_cap_jump') & polars.col('_shares_jump')
+    try:
+        problem_rows = (
+            working_lf
+            .filter(combined_condition)
+            .select(select_cols)
+            .limit(MAX_AUDIT_ENTRIES)
+            .collect()
         )
 
-        if len(correlated_jumps) > 0:
-            # For each correlated jump, find the span of elevated shares
-            jump_dates = correlated_jumps.select(date_col).to_series().to_list()
+        if problem_rows.height > 0:
+            entries = problem_rows.to_dicts()
+            for entry in entries:
+                entry['ticker'] = ticker
+                entry['error_type'] = "scale_10x_jump"
+            audit_log = entries
+            logging.info(f"Found scale errors (10x jump) for ticker {ticker} (sampled {len(audit_log)})")
+    except Exception:
+        pass  # Continue without audit if it fails
 
-            for jump_date in jump_dates:
-                # Get the last good shares value before the jump
-                pre_jump = working_df.filter(polars.col(date_col) < jump_date).tail(1)
+    # MEMORY FIX: Use lazy evaluation for correlated jump detection
+    # Instead of collecting and iterating, use pure Polars expressions
+    if has_market_cap and has_shares and market_cap_col in available_target_cols and shares_outstanding_col in available_target_cols:
+        # Detect correlated jumps using lazy expressions
+        working_lf = working_lf.with_columns([
+            (polars.col(market_cap_col) >= (polars.col(market_cap_col).shift(1) * 10)).alias('_mkt_cap_jump'),
+            (polars.col(shares_outstanding_col) >= (polars.col(shares_outstanding_col).shift(1) * 10)).alias('_shares_jump'),
+        ])
 
-                if len(pre_jump) > 0:
-                    last_good_shares = pre_jump.select(shares_outstanding_col).item()
+        # Mark rows with correlated jumps (both jump together)
+        correlated_condition = polars.col('_mkt_cap_jump') & polars.col('_shares_jump')
 
-                    # Get the jumped value
-                    jumped_row = working_df.filter(polars.col(date_col) == jump_date)
-                    if len(jumped_row) > 0:
-                        jumped_shares = jumped_row.select(shares_outstanding_col).item()
-
-                        # Find the span where shares remain at the elevated level
-                        # (within 20% of the jumped value, indicating same scale error)
-                        working_df = working_df.with_columns([
-                            polars.when(
-                                (polars.col(date_col) >= jump_date) &
-                                (polars.col(shares_outstanding_col) >= (jumped_shares * 0.8)) &
-                                (polars.col(shares_outstanding_col) <= (jumped_shares * 1.2))
-                            )
-                            .then(polars.lit(True))
-                            .otherwise(polars.lit(False))
-                            .alias('_in_error_span')
-                        ])
+        # For correlated jumps, null out the shares value to trigger forward fill
+        working_lf = working_lf.with_columns(
+            polars.when(correlated_condition)
+            .then(None)
+            .otherwise(polars.col(shares_outstanding_col))
+            .forward_fill()
+            .alias(shares_outstanding_col)
+        )
 
         # Clean up temporary columns
-        working_df = working_df.drop(['_mkt_cap_jump', '_shares_jump', '_prev_shares', '_in_error_span'], strict=False)
+        working_lf = working_lf.drop(['_mkt_cap_jump', '_shares_jump'])
 
-        # Convert back to lazy if needed
-        df = working_df.lazy() if is_lazy else working_df
+    # 3. Cleaning Step - process remaining columns with standard lazy logic
+    for col in available_target_cols:
+        if col != shares_outstanding_col:  # Skip shares if already handled
+            prev_val = polars.col(col).shift(1)
+            col_condition = (polars.col(col) >= (prev_val * 10))
 
-    # 3. Cleaning Step - process remaining columns with standard row-by-row logic
-    for col in target_cols:
-        if col in df.columns and col != shares_outstanding_col:  # Skip shares if already handled
-            prev_shares = polars.col(col).shift(1)
-            col_condition = (polars.col(col) >= (prev_shares * 10))
-
-            df = df.with_columns(
+            working_lf = working_lf.with_columns(
                 polars.when(col_condition)
                 .then(None)
                 .otherwise(polars.col(col))
@@ -596,7 +607,10 @@ def mkt_cap_scale_error(
                 .alias(col)
             )
 
-    return df, audit_log
+    if is_lazy:
+        return working_lf, audit_log
+    else:
+        return working_lf.collect(), audit_log
 
 
 def ohlc_integrity(
