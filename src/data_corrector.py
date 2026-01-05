@@ -1,6 +1,7 @@
 from pathlib import Path
 import logging
 import polars
+import json
 
 from src.input_handlers.csv_reader import read_csv_files_to_polars
 from src.modules.errors.sanity_check.sanity_check import (
@@ -14,16 +15,17 @@ from src.modules.errors.sanity_check.sanity_check import (
     validate_market_split_consistency
 )
 from src.features.lazy_parallelization import parallel_process_tickers
-from src.dashboard.dashboard import run_dashboard
+# from src.dashboard.dashboard import run_dashboard
 
 current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
+sanity_check_output_logs_directory = current_dir / ".." / "Output" / "sanity_check" / "error_logs"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=500)
+    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=7000)
 
     # Store original dataframes for comparison (deep copy before any modifications)
     original_dataframe_dict = {}
@@ -116,47 +118,55 @@ if __name__ == "__main__":
             data_dict=dataframe_dict,
             columns=date_cols,
             function=sort_dates,
+            batch_size=100
         )
 
         dataframe_dict_clean_negatives_fundamentals, negative_fundamentals_logs = parallel_process_tickers(
             data_dict=dataframe_dict_sorted_dates,
             columns=fundamental_negatives_columns,
-            function=fill_negatives_fundamentals
+            function=fill_negatives_fundamentals,
+            batch_size=100
         )
 
         dataframe_dict_clean_negatives_market, negative_market_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_negatives_fundamentals,
             columns=market_negatives_columns,
             function=fill_negatives_market,
+            batch_size=100
         )
 
         dataframe_dict_clean_zero_wipeout, zero_wipeout_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_negatives_market,
             columns=zero_wipeout_columns,
-            function=zero_wipeout
+            function=zero_wipeout,
+            batch_size=100
         )
 
         dataframe_dict_clean_10x_shares_outstanding, shares_outstanding_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_zero_wipeout,
             columns=shares_outstanding_10x_columns,
-            function=mkt_cap_scale_error
+            function=mkt_cap_scale_error,
+            batch_size=100
         )
 
         dataframe_dict_clean_ohlc_integrity, ohlc_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_10x_shares_outstanding,
             columns=ohlc_integrity_columns,
-            function=ohlc_integrity
+            function=ohlc_integrity,
+            batch_size=100
         )
 
         dataframe_dict_clean_financial_equivalencies, financial_unequivalencies_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_ohlc_integrity,
             function=validate_financial_equivalencies,
+            batch_size=100
         )
 
         dataframe_dict_clean_split_consistency, split_inconsistencies_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_financial_equivalencies,
             columns=market_inconsistencies_columns,
             function=validate_market_split_consistency,
+            batch_size=100
         )
 
         logs_sanity_check = {
@@ -166,7 +176,7 @@ if __name__ == "__main__":
             "zero_wipeout_logs": zero_wipeout_logs,
             "shares_outstanding_logs": shares_outstanding_logs,
             "ohlc_logs": ohlc_logs,
-            "financial_unequivalencies_logs": financial_unequivalencies_logs,
+            "financial_unequivalencies_logs": financial_unequivalencies_logs["hard_filter_errors"],
             "split_inconsistencies_logs": split_inconsistencies_logs
         }
         return dataframe_dict_clean_split_consistency, logs_sanity_check
@@ -174,13 +184,14 @@ if __name__ == "__main__":
 
     clean_dfs, logs = run_full_sanity_check()
 
-    print("Data cleaning complete. Launching dashboard...")
+    with open(sanity_check_output_logs_directory / 'logs_sanity_check.json', 'w') as f:
+        json.dump(logs, f, indent=4, default=str)
 
-    # Launch the dashboard with original and cleaned data
-    run_dashboard(
-        original_dataframes=original_dataframe_dict,
-        cleaned_dataframes=clean_dfs,
-        logs=logs,
-        debug=True,
-        port=8050
-    )
+    # # Launch the dashboard with original and cleaned data
+    # run_dashboard(
+    #     original_dataframes=original_dataframe_dict,
+    #     cleaned_dataframes=clean_dfs,
+    #     logs=logs,
+    #     debug=True,
+    #     port=8050
+    # )
