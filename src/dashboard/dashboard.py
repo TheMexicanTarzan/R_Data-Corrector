@@ -912,8 +912,83 @@ def create_layout() -> dbc.Container:
 # DASH APPLICATION FACTORY
 # ============================================================================
 
+def load_original_on_demand(file_path, schema_overrides=None):
+    """
+    Load original data on-demand when needed for visualization.
+    MEMORY FIX: Only loads data when user selects a ticker for visualization.
+    """
+    try:
+        from src.input_handlers.csv_reader import FINANCIAL_DATA_SCHEMA
+
+        # Build schema overrides similar to csv_reader
+        current_overrides = {}
+        date_cols_to_convert = []
+
+        temp_scan = polars.scan_csv(str(file_path), n_rows=1)
+        file_columns = temp_scan.collect_schema().names()
+
+        for col in file_columns:
+            if col in FINANCIAL_DATA_SCHEMA:
+                target_type = FINANCIAL_DATA_SCHEMA[col]
+                if target_type == polars.Date:
+                    current_overrides[col] = polars.String
+                    date_cols_to_convert.append(col)
+                else:
+                    current_overrides[col] = target_type
+            else:
+                current_overrides[col] = polars.Float64
+
+        # Read the file
+        frame = polars.read_csv(
+            str(file_path),
+            schema_overrides=current_overrides,
+            infer_schema_length=10000
+        )
+
+        # Convert date columns
+        if date_cols_to_convert:
+            date_expressions = [
+                polars.col(c).str.to_date("%m/%d/%Y", strict=False).alias(c)
+                for c in date_cols_to_convert
+            ]
+            frame = frame.with_columns(date_expressions)
+
+        return frame
+    except Exception as e:
+        print(f"Error loading original file {file_path}: {e}")
+        return None
+
+
+# Cache for loaded original dataframes (LRU-style, keeps last N)
+_original_cache = {}
+_CACHE_MAX_SIZE = 5
+
+
+def get_original_dataframe(ticker: str, file_paths: dict):
+    """Get original dataframe, loading on-demand with caching."""
+    global _original_cache
+
+    if ticker in _original_cache:
+        return _original_cache[ticker]
+
+    if ticker not in file_paths:
+        return None
+
+    # Load on demand
+    df = load_original_on_demand(file_paths[ticker])
+
+    if df is not None:
+        # Evict oldest if cache full
+        if len(_original_cache) >= _CACHE_MAX_SIZE:
+            oldest = next(iter(_original_cache))
+            del _original_cache[oldest]
+        _original_cache[ticker] = df
+
+    return df
+
+
 def create_app(
-    original_dataframes: dict[str, polars.DataFrame],
+    original_file_paths: dict[str, any],
     cleaned_dataframes: dict[str, Union[polars.DataFrame, polars.LazyFrame]],
     logs: dict,
 ) -> dash.Dash:
@@ -921,7 +996,7 @@ def create_app(
     Create and configure the Dash application.
 
     Args:
-        original_dataframes: Dict of ticker -> original DataFrame
+        original_file_paths: Dict of ticker -> file path for on-demand loading
         cleaned_dataframes: Dict of ticker -> cleaned DataFrame/LazyFrame
         logs: Dict of log category -> log entries
 
@@ -1258,8 +1333,8 @@ def create_app(
             )
             return fig
 
-        # Get data
-        original_df = original_dataframes.get(ticker)
+        # MEMORY FIX: Get original data on-demand
+        original_df = get_original_dataframe(ticker, original_file_paths)
         cleaned_df = cleaned_dataframes.get(ticker)
 
         if original_df is None or cleaned_df is None:
@@ -1595,7 +1670,7 @@ def create_app(
 # ============================================================================
 
 def run_dashboard(
-    original_dataframes: dict[str, polars.DataFrame],
+    original_file_paths: dict[str, any],
     cleaned_dataframes: dict[str, Union[polars.DataFrame, polars.LazyFrame]],
     logs: dict,
     debug: bool = True,
@@ -1605,19 +1680,19 @@ def run_dashboard(
     Run the Data Corrector dashboard.
 
     Args:
-        original_dataframes: Dict of ticker -> original DataFrame
+        original_file_paths: Dict of ticker -> file path for on-demand loading
         cleaned_dataframes: Dict of ticker -> cleaned DataFrame/LazyFrame
         logs: Dict of log category -> log entries
         debug: Whether to run in debug mode
         port: Port number for the server
     """
-    app = create_app(original_dataframes, cleaned_dataframes, logs)
+    app = create_app(original_file_paths, cleaned_dataframes, logs)
 
     print(f"\n{'='*60}")
     print("Data Corrector Dashboard")
     print(f"{'='*60}")
     print(f"Starting server at http://127.0.0.1:{port}")
-    print(f"Loaded {len(original_dataframes)} tickers")
+    print(f"Loaded {len(original_file_paths)} ticker file paths (on-demand loading)")
     print(f"Debug mode: {debug}")
     print(f"{'='*60}\n")
 

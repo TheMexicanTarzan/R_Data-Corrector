@@ -25,14 +25,11 @@ logger = logging.getLogger(__name__)
 if __name__ == "__main__":
     dataframe_dict = read_csv_files_to_polars(data_directory, max_files=500)
 
-    # Store original dataframes for comparison (deep copy before any modifications)
-    original_dataframe_dict = {}
-    for ticker, df in dataframe_dict.items():
-        # Collect LazyFrames for the copy, then store
-        if isinstance(df, polars.LazyFrame):
-            original_dataframe_dict[ticker] = df.collect().clone()
-        else:
-            original_dataframe_dict[ticker] = df.clone()
+    # MEMORY FIX: Don't pre-collect all originals - store file paths for on-demand loading
+    # The dashboard will load originals lazily when needed for visualization
+    original_file_paths = {
+        ticker: data_directory / ticker for ticker in dataframe_dict.keys()
+    }
 
 
     def run_full_sanity_check():
@@ -176,9 +173,9 @@ if __name__ == "__main__":
 
     print("Data cleaning complete. Launching dashboard...")
 
-    # Launch the dashboard with original and cleaned data
+    # Launch the dashboard with file paths for on-demand loading (memory efficient)
     run_dashboard(
-        original_dataframes=original_dataframe_dict,
+        original_file_paths=original_file_paths,
         cleaned_dataframes=clean_dfs,
         logs=logs,
         debug=True,
