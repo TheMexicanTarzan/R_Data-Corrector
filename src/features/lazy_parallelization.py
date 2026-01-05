@@ -174,7 +174,7 @@ def parallel_process_tickers(
     - LazyFrames are kept lazy (not collected)
 
     Args:
-        data_dict: Dictionary mapping ticker symbols to LazyFrames
+        data_dict: Dictionary mapping ticker symbols to LazyFrames (or Tuples of LF, Metadata)
         columns: List of column names to process
         function: Validation/cleaning function to apply
         max_workers: Number of parallel threads
@@ -208,15 +208,27 @@ def parallel_process_tickers(
                     f"tickers {batch_start} to {batch_end - 1} ({len(batch_tickers)} tickers)")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ticker = {
-                executor.submit(
+            future_to_ticker = {}
+
+            # --- MINIMAL FIX START ---
+            for ticker in batch_tickers:
+                payload = data_dict[ticker]
+
+                # Check if payload is a Tuple (Data, Metadata) and extract Data
+                if isinstance(payload, tuple):
+                    lf_input = payload[0]
+                else:
+                    lf_input = payload
+
+                future = executor.submit(
                     process_single_ticker,
-                    data_dict[ticker],
+                    lf_input,
                     columns,
                     ticker,
                     function
-                ): ticker for ticker in batch_tickers
-            }
+                )
+                future_to_ticker[future] = ticker
+            # --- MINIMAL FIX END ---
 
             futures = list(future_to_ticker.keys())
             iterator = tqdm(as_completed(futures), total=len(futures),
@@ -260,7 +272,6 @@ def parallel_process_tickers(
     logger.info(f"Total audit logs collected: {total_logs_collected} entries across {len(cleaned_lazyframes)} tickers")
 
     return cleaned_lazyframes, all_audit_logs
-
 
 def get_log_size(audit_log) -> int:
     """

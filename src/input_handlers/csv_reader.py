@@ -1,15 +1,15 @@
 import polars
 import os
 import glob
-from typing import Dict, Union, Optional, List
+from typing import Union, Optional, Tuple
 
 data_dir = "../../Input/Data"
 metadata_dir = "../../Input/Universe_Information/Universe_Information.csv"
 
+# ============================================================================
+# 1. DEFINE SCHEMAS
+# ============================================================================
 
-# ============================================================================
-# 1. DEFINE THE STRICT SCHEMA
-# ============================================================================
 FINANCIAL_DATA_SCHEMA = {
     # --- Market Data ---
     'm_open': polars.Float64, 'm_high': polars.Float64, 'm_low': polars.Float64, 'm_close': polars.Float64,
@@ -46,6 +46,45 @@ FINANCIAL_DATA_SCHEMA = {
     'c_count': polars.Int64, 'c_row_number': polars.Int64
 }
 
+METADATA_SCHEMA = {
+    'symbol': polars.String,
+    'price': polars.Float64,
+    'marketCap': polars.Float64,
+    'beta': polars.Float64,
+    'lastDividend': polars.Float64,
+    'range': polars.String,
+    'change': polars.Float64,
+    'changePercentage': polars.Float64,
+    'volume': polars.Int64,
+    'averageVolume': polars.Int64,
+    'companyName': polars.String,
+    'currency': polars.String,
+    'cik': polars.String,
+    'isin': polars.String,
+    'cusip': polars.String,
+    'exchangeFullName': polars.String,
+    'exchange': polars.String,
+    'industry': polars.String,
+    'website': polars.String,
+    'description': polars.String,
+    'ceo': polars.String,
+    'sector': polars.String,
+    'country': polars.String,
+    'fullTimeEmployees': polars.String,  # Often contains commas or is null
+    'phone': polars.String,
+    'address': polars.String,
+    'city': polars.String,
+    'state': polars.String,
+    'zip': polars.String,
+    'image': polars.String,
+    'ipoDate': polars.String,  # Read as string first to handle formats safely
+    'defaultImage': polars.Boolean,
+    'isEtf': polars.Boolean,
+    'isActivelyTrading': polars.Boolean,
+    'isAdr': polars.Boolean,
+    'isFund': polars.Boolean
+}
+
 
 # ============================================================================
 # 2. FUNCTION IMPLEMENTATION
@@ -53,21 +92,44 @@ FINANCIAL_DATA_SCHEMA = {
 
 def read_csv_files_to_polars(
         directory_path: str,
+        metadata_path: str = metadata_dir,
         lazy: bool = True,
         max_files: Optional[int] = None,
         file_pattern: str = "*.csv",
-        include_files: Optional[List[str]] = None,
-        exclude_files: Optional[List[str]] = None,
+        include_files: Optional[list[str]] = None,
+        exclude_files: Optional[list[str]] = None,
         use_schema_override: bool = True
-) -> Dict[str, Union[polars.LazyFrame, polars.DataFrame]]:
+) -> dict[str, Tuple[Union[polars.LazyFrame, polars.DataFrame], polars.LazyFrame]]:
     """
     Reads CSV files from a directory into a dictionary of Polars frames.
-    - Enforces a strict schema where known columns are typed correctly.
-    - UNKNOWN columns are forced to Float64.
-    - Handles US Date Formats (MM/DD/YYYY) by reading as String first, then parsing.
+
+    Returns:
+        dict: Keys are filenames. Values are Tuples: (TickerData, Metadata)
+              - TickerData: LazyFrame or DataFrame of price history
+              - Metadata: LazyFrame containing the single row of info for that ticker
     """
 
-    # 1. Locate files
+    # 1. Prepare Metadata
+    # We scan the metadata file once. We will filter it later for each ticker.
+    try:
+        # Note: We infer schema length 0 to force using our strict schema,
+        # or we can allow inference if the file is messy. Here we enforce schema overrides.
+        full_metadata_lf = polars.scan_csv(
+            metadata_path,
+            schema_overrides=METADATA_SCHEMA,
+            infer_schema_length=10000
+        )
+
+        # Convert ipoDate from String to Date if needed
+        full_metadata_lf = full_metadata_lf.with_columns(
+            polars.col("ipoDate").str.to_date("%Y-%m-%d", strict=False).alias("ipoDate")
+        )
+    except Exception as e:
+        print(f"Warning: Could not load metadata from {metadata_path}. Error: {e}")
+        # Create an empty dummy LF if metadata fails, to prevent crash
+        full_metadata_lf = polars.LazyFrame(schema=METADATA_SCHEMA)
+
+    # 2. Locate Data Files
     search_path = os.path.join(directory_path, file_pattern)
     all_files = glob.glob(search_path)
 
@@ -75,7 +137,7 @@ def read_csv_files_to_polars(
         print(f"No files found in {search_path}")
         return {}
 
-    # 2. Filter files
+    # 3. Filter files
     files_to_process = []
     for file_path in all_files:
         filename = os.path.basename(file_path)
@@ -85,7 +147,7 @@ def read_csv_files_to_polars(
             continue
         files_to_process.append(file_path)
 
-    # 3. Apply Limit
+    # 4. Apply Limit
     if max_files is not None:
         files_to_process = files_to_process[:max_files]
 
@@ -95,31 +157,29 @@ def read_csv_files_to_polars(
     for file_path in files_to_process:
         filename = os.path.basename(file_path)
 
+        # Extract ticker symbol from filename (e.g., "AAPL.csv" -> "AAPL")
+        ticker_symbol = os.path.splitext(filename)[0]
+
         try:
-            # Step A: Create the Schema Overrides & conversion lists
+            # --- PART A: Process Financial Data ---
             current_overrides = {}
             date_cols_to_convert = []
 
             if use_schema_override:
-                # Scan header to see what columns exist in THIS file
                 temp_scan = polars.scan_csv(file_path, n_rows=1)
                 file_columns = temp_scan.collect_schema().names()
 
                 for col in file_columns:
                     if col in FINANCIAL_DATA_SCHEMA:
                         target_type = FINANCIAL_DATA_SCHEMA[col]
-
-                        # SPECIAL HANDLING: If it's a Date, read as String first to avoid crash
                         if target_type == polars.Date:
                             current_overrides[col] = polars.String
                             date_cols_to_convert.append(col)
                         else:
                             current_overrides[col] = target_type
                     else:
-                        # Unknown column -> Default to Float64
                         current_overrides[col] = polars.Float64
 
-            # Step B: Read the Data (Dates are read as Strings here)
             if lazy:
                 frame = polars.scan_csv(
                     file_path,
@@ -133,16 +193,21 @@ def read_csv_files_to_polars(
                     infer_schema_length=10000
                 )
 
-            # Step C: Apply Date Conversion (String -> Date)
             if date_cols_to_convert:
-                # We construct a list of expressions to run in parallel
                 date_expressions = [
                     polars.col(c).str.to_date("%m/%d/%Y", strict=False).alias(c)
                     for c in date_cols_to_convert
                 ]
                 frame = frame.with_columns(date_expressions)
 
-            results[filename] = frame
+            # --- PART B: Process Metadata ---
+            # Create a LazyFrame specific to this ticker
+            ticker_metadata = full_metadata_lf.filter(
+                polars.col("symbol") == ticker_symbol
+            )
+
+            # --- PART C: Store Result ---
+            results[filename] = (frame, ticker_metadata)
 
         except Exception as e:
             print(f"Error processing {filename}: {e}")
