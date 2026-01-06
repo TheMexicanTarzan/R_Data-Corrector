@@ -20,19 +20,27 @@ def mahalanobis_filter(
     to identify multivariate outliers in quarterly fundamental data. The analysis is
     performed cross-sectionally within the same sector peer group.
 
+    IMPORTANT: This is a cross-sectional filter. The input df MUST contain data for
+    multiple tickers (the entire universe or at least all sector peers). If df only
+    contains the target ticker's data, the function will return it unchanged with
+    an appropriate log message.
+
     Process:
-        1. Filter df to include all tickers sharing the same sector as the target ticker
-        2. Downsample daily data to quarterly (last valid entry per quarter)
-        3. Fit MinCovDet to estimate robust covariance and mean
-        4. Calculate Mahalanobis Distance D²_M for the target ticker's quarterly points
-        5. Flag quarters where D²_M > χ²(p, 0.99)
-        6. Broadcast flags to all daily entries within violating quarters
-        7. Forward-fill entire violating quarter with last valid observation from previous quarter
+        1. Use metadata to identify the target ticker's sector
+        2. Filter df to include all tickers sharing the same sector
+        3. Downsample daily data to quarterly (last valid entry per quarter)
+        4. Fit MinCovDet to estimate robust covariance and mean
+        5. Calculate Mahalanobis Distance D²_M for the target ticker's quarterly points
+        6. Flag quarters where D²_M > χ²(p, 0.99)
+        7. Broadcast flags to all daily entries within violating quarters
+        8. Forward-fill entire violating quarter with last valid observation from previous quarter
 
     Args:
-        df: Input DataFrame or LazyFrame containing daily data for the ENTIRE universe
-            of tickers. Must contain a "ticker" column to identify different securities.
+        df: Input DataFrame or LazyFrame containing daily data for the universe of
+            tickers. Must contain a "ticker" column to identify different securities.
+            For cross-sectional analysis to work, df must include data for peer tickers.
         metadata: LazyFrame containing metadata with at least "ticker" and "sector" columns.
+            Used to identify which tickers belong to the same sector.
         ticker: Target ticker symbol to analyze and correct.
         columns: List of column names (fundamentals) to include in multivariate analysis.
         date_col: Name of the date column (default: 'm_date').
@@ -40,8 +48,7 @@ def mahalanobis_filter(
 
     Returns:
         tuple containing:
-            - Corrected DataFrame/LazyFrame (same type as input) - only target ticker's
-              data is modified
+            - Corrected DataFrame/LazyFrame containing ONLY the target ticker's data
             - List of dictionaries documenting each correction made
     """
     is_lazy = isinstance(df, polars.LazyFrame)
@@ -61,8 +68,9 @@ def mahalanobis_filter(
             "error_type": "missing_date_column",
             "message": f"Date column '{date_col}' not found in dataframe"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker) if "ticker" in schema_cols else working_lf
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
     if "ticker" not in schema_cols:
         logs.append({
@@ -80,8 +88,9 @@ def mahalanobis_filter(
             "error_type": "missing_metadata",
             "message": "Metadata not provided, cannot determine sector peer group"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
     metadata_schema = metadata.collect_schema()
     if "sector" not in metadata_schema.names():
@@ -90,8 +99,9 @@ def mahalanobis_filter(
             "error_type": "missing_sector_column",
             "message": "Sector column not found in metadata"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
     # Filter available analysis columns
     available_cols = [col for col in columns if col in schema_cols]
@@ -102,8 +112,9 @@ def mahalanobis_filter(
             "error_type": "insufficient_columns",
             "message": f"Need at least 2 columns for multivariate analysis, found {len(available_cols)}"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
     # Get target ticker's sector from metadata
     target_sector_df = (
@@ -120,8 +131,9 @@ def mahalanobis_filter(
             "error_type": "ticker_not_in_metadata",
             "message": f"Ticker '{ticker}' not found in metadata"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
     target_sector = target_sector_df["sector"][0]
 
@@ -131,10 +143,11 @@ def mahalanobis_filter(
             "error_type": "null_sector",
             "message": f"Sector is null for ticker '{ticker}'"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
-    # Get all tickers in the same sector
+    # Get all tickers in the same sector from metadata
     peer_tickers_df = (
         metadata
         .filter(polars.col("sector") == target_sector)
@@ -150,14 +163,46 @@ def mahalanobis_filter(
             "error_type": "insufficient_peers",
             "message": f"Only {len(peer_tickers)} peers in sector '{target_sector}', need at least 5"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
-    # Filter df to include only peer tickers
+    # Check which peer tickers actually exist in df
+    tickers_in_df = (
+        working_lf
+        .select("ticker")
+        .unique()
+        .collect()
+    )["ticker"].to_list()
+
+    available_peers = [t for t in peer_tickers if t in tickers_in_df]
+
+    if len(available_peers) < 5:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "insufficient_peer_data",
+            "message": f"Only {len(available_peers)} peers found in df (need 5). "
+                       f"Ensure df contains data for the full universe or sector peers."
+        })
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
+
+    if ticker not in tickers_in_df:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "target_ticker_missing",
+            "message": f"Target ticker '{ticker}' not found in dataframe"
+        })
+        # Return empty LazyFrame with correct schema
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
+
+    # Filter df to include only peer tickers (including target)
     select_cols = ["ticker", date_col] + available_cols
     peer_df = (
         working_lf
-        .filter(polars.col("ticker").is_in(peer_tickers))
+        .filter(polars.col("ticker").is_in(available_peers))
         .select(select_cols)
         .collect()
     )
@@ -168,8 +213,9 @@ def mahalanobis_filter(
             "error_type": "no_peer_data",
             "message": "No data found for peer tickers"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
     # Add quarter column for downsampling
     # Quarter format: YYYY-Q
@@ -199,8 +245,9 @@ def mahalanobis_filter(
             "error_type": "insufficient_quarters",
             "message": f"Only {len(unique_quarters)} quarters available, need at least 4"
         })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        # Return only target ticker's data
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
     # Chi-square threshold at specified confidence level
     p = len(available_cols)  # Number of dimensions
@@ -284,13 +331,7 @@ def mahalanobis_filter(
             })
             continue
 
-    if not violating_quarters:
-        # No outliers found, return original data
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
-
-    # Now impute the violating quarters for the target ticker
-    # Extract target ticker's daily data
+    # Extract target ticker's daily data for returning
     target_daily_df = (
         working_lf
         .filter(polars.col("ticker") == ticker)
@@ -299,9 +340,17 @@ def mahalanobis_filter(
     )
 
     if target_daily_df.is_empty():
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        result_lf = working_lf.filter(polars.col("ticker") == ticker)
+        return (result_lf if is_lazy else result_lf.collect(), logs)
 
+    if not violating_quarters:
+        # No outliers found, return target ticker's data unchanged
+        if is_lazy:
+            return target_daily_df.lazy(), logs
+        else:
+            return target_daily_df, logs
+
+    # Impute the violating quarters for the target ticker
     # Add quarter column to target daily data
     target_daily_df = target_daily_df.with_columns(
         (
@@ -401,16 +450,8 @@ def mahalanobis_filter(
     # Remove the _quarter helper column
     target_daily_df = target_daily_df.drop("_quarter")
 
-    # Merge corrected target data back into full dataset
-    # Remove original target ticker data and append corrected version
-    other_tickers_lf = working_lf.filter(polars.col("ticker") != ticker)
-
-    result_lf = polars.concat([
-        other_tickers_lf,
-        target_daily_df.lazy()
-    ])
-
+    # Return only the target ticker's corrected data
     if is_lazy:
-        return result_lf, logs
+        return target_daily_df.lazy(), logs
     else:
-        return result_lf.collect(), logs
+        return target_daily_df, logs

@@ -144,13 +144,25 @@ def truncate_ticker_logs(audit_log, max_entries: int = MAX_LOGS_PER_TICKER):
 def process_single_ticker(lf: polars.LazyFrame,
                           columns: list[str],
                           ticker: str,
-                          function: Callable) -> tuple[polars.LazyFrame, list[dict]]:
+                          function: Callable,
+                          metadata: polars.LazyFrame = None) -> tuple[polars.LazyFrame, list[dict]]:
     """
-    Process a single ticker file through any cleaning function
+    Process a single ticker file through any cleaning function.
+
+    Args:
+        lf: LazyFrame containing ticker data
+        columns: List of column names to process
+        ticker: Ticker symbol
+        function: Validation/cleaning function to apply
+        metadata: Optional LazyFrame containing metadata (e.g., sector information)
+
+    Returns:
+        Tuple of (ticker, cleaned_lazyframe, audit_log)
     """
 
     # Apply cleaning functions in sequence
-    lf, audit = function(df=lf, columns=columns, ticker=ticker)
+    # Pass metadata if the function signature supports it
+    lf, audit = function(df=lf, columns=columns, ticker=ticker, metadata=metadata)
 
     return ticker, lf, audit
 
@@ -210,25 +222,28 @@ def parallel_process_tickers(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_ticker = {}
 
-            # --- MINIMAL FIX START ---
+            # --- TUPLE HANDLING: Extract (Data, Metadata) ---
             for ticker in batch_tickers:
                 payload = data_dict[ticker]
 
-                # Check if payload is a Tuple (Data, Metadata) and extract Data
+                # Check if payload is a Tuple (Data, Metadata) and extract both
                 if isinstance(payload, tuple):
                     lf_input = payload[0]
+                    metadata = payload[1] if len(payload) > 1 else None
                 else:
                     lf_input = payload
+                    metadata = None
 
                 future = executor.submit(
                     process_single_ticker,
                     lf_input,
                     columns,
                     ticker,
-                    function
+                    function,
+                    metadata
                 )
                 future_to_ticker[future] = ticker
-            # --- MINIMAL FIX END ---
+            # --- END TUPLE HANDLING ---
 
             futures = list(future_to_ticker.keys())
             iterator = tqdm(as_completed(futures), total=len(futures),
