@@ -355,7 +355,8 @@ if __name__ == "__main__":
             data_dict=dataframe_dict_clean_mad,
             columns=garch_cols,
             function=garch_residuals,
-            batch_size=batch_size
+            batch_size=batch_size,
+            max_workers=1
         )
 
         logs ={

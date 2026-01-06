@@ -1,286 +1,175 @@
-import polars
-import numpy
+import polars as pl
+import numpy as np
 from typing import Union
 from scipy.interpolate import CubicSpline
+from scipy.stats import t
 from arch import arch_model
 
 
 def garch_residuals(
-    df: Union[polars.DataFrame, polars.LazyFrame],
-    metadata: polars.LazyFrame,
-    ticker: str,
-    columns: list[str],
-    date_col: str = "m_date",
-    confidence: float = 0.01
-) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
+        df: Union[pl.DataFrame, pl.LazyFrame],
+        metadata: pl.LazyFrame,
+        ticker: str,
+        columns: list[str],
+        date_col: str = "m_date",
+        confidence: float = 0.01
+) -> tuple[Union[pl.DataFrame, pl.LazyFrame], list[dict]]:
     """
-    Detect and correct outliers using GARCH(1,1) volatility clustering.
-
-    Fits a GARCH(1,1) model with Student's T-distribution to handle fat tails.
-    Calculates standardized residuals and flags observations
-    where |z_t| > 3.5. Flagged values are imputed using cubic spline interpolation.
-
-    Constraint: Ensures alpha + beta < 1 for stationarity.
-
-    Args:
-        df: Input DataFrame or LazyFrame containing market data for a single ticker.
-        metadata: LazyFrame containing metadata (unused in this filter but required
-                  for signature consistency).
-        ticker: Ticker symbol for logging purposes.
-        columns: List of column names to apply GARCH filter to.
-        date_col: Name of the date column (default: 'm_date').
-        confidence: Confidence level for outlier detection (unused, threshold is 3.5).
-
-    Returns:
-        tuple containing:
-            - Corrected DataFrame/LazyFrame (same type as input)
-            - List of dictionaries documenting each correction made
+    Detect and correct outliers using GARCH(1,1) (Performance Optimized).
     """
-    is_lazy = isinstance(df, polars.LazyFrame)
+    is_lazy = isinstance(df, pl.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
 
-    # Get schema to check column existence
     schema_cols = set(working_lf.collect_schema().names())
-
-    # Initialize logs
     logs = []
     MAX_CORRECTIONS_LOG = 50
 
-    # Check if date column exists
     if date_col not in schema_cols:
-        logs.append({
-            "ticker": ticker,
-            "error_type": "missing_date_column",
-            "message": f"Date column '{date_col}' not found in dataframe"
-        })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        logs.append({"ticker": ticker, "error_type": "missing_date", "message": f"Date column '{date_col}' not found"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # Filter available columns
     available_cols = [col for col in columns if col in schema_cols]
-
     if not available_cols:
-        logs.append({
-            "ticker": ticker,
-            "error_type": "no_valid_columns",
-            "message": "No valid columns found for GARCH analysis"
-        })
-        result_df = working_lf if is_lazy else working_lf.collect()
-        return (result_df, logs)
+        logs.append({"ticker": ticker, "error_type": "no_valid_cols", "message": "No valid columns found"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # Collect data for numpy processing (GARCH requires eager evaluation)
     needed_cols = [date_col] + available_cols
     working_df = working_lf.select(needed_cols).sort(date_col).collect()
-
-    # Get dates for logging
     dates = working_df[date_col].to_list()
 
-    # Threshold for outlier detection
-    threshold = 3.5
+    # Pre-extract all columns as numpy arrays upfront
+    col_arrays = {col: working_df[col].to_numpy().astype(np.float64, copy=True)
+                  for col in available_cols}
+
+    modified_cols = {}
 
     for col in available_cols:
-        col_corrections_logged = 0
-
-        # Extract values as numpy array
-        values = working_df[col].to_numpy().astype(numpy.float64)
-
-        # Track original null positions
-        null_mask = ~numpy.isfinite(values)
-
-        # Get valid (non-null) values and their indices
-        valid_mask = numpy.isfinite(values)
-        valid_indices = numpy.where(valid_mask)[0]
+        col_values = col_arrays[col]
+        valid_mask = np.isfinite(col_values)
+        valid_indices = np.flatnonzero(valid_mask)
 
         if len(valid_indices) < 100:
-            # Not enough data for GARCH estimation
-            logs.append({
-                "ticker": ticker,
-                "column": col,
-                "error_type": "insufficient_data",
-                "message": f"Only {len(valid_indices)} valid observations, need at least 100 for GARCH"
-            })
+            logs.append({"ticker": ticker, "column": col, "error_type": "insufficient_data",
+                         "message": f"Only {len(valid_indices)} valid obs"})
             continue
 
-        # Calculate returns for GARCH model (percentage changes)
-        valid_values = values[valid_mask]
-        returns = numpy.diff(valid_values) / valid_values[:-1] * 100
+        valid_values = col_values[valid_indices]
 
-        # Handle any inf/nan in returns
-        returns = numpy.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+        # Vectorized returns calculation with suppressed warnings
+        with np.errstate(divide='ignore', invalid='ignore'):
+            returns = np.diff(valid_values) / valid_values[:-1] * 100
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if len(returns) < 100:
-            logs.append({
-                "ticker": ticker,
-                "column": col,
-                "error_type": "insufficient_returns",
-                "message": f"Only {len(returns)} returns available, need at least 100"
-            })
+        if len(returns) < 100 or np.std(returns) < 1e-6:
             continue
 
         try:
-            # Fit GARCH(1,1) model with Student's T distribution
-            model = arch_model(
-                returns,
-                vol='Garch',
-                p=1,
-                q=1,
-                dist='t',
-                rescale=True
-            )
+            model = arch_model(returns, vol='Garch', p=1, q=1, dist='t', rescale=True, method_used = "analytical")
+            result = model.fit(disp='off', show_warning=False,
+                               options={'ftol': 1e-3, 'maxiter': 100})
 
-            # Fit the model
-            result = model.fit(disp='off', show_warning=False)
-
-            # Extract parameters
             params = result.params
             alpha = params.get('alpha[1]', 0)
             beta = params.get('beta[1]', 0)
+            nu = params.get('nu', 1000)
 
-            # Check stationarity constraint
             if alpha + beta >= 1:
-                logs.append({
-                    "ticker": ticker,
-                    "column": col,
-                    "error_type": "non_stationary_garch",
-                    "message": f"GARCH model non-stationary: alpha + beta = {alpha + beta:.4f} >= 1",
-                    "alpha": float(alpha),
-                    "beta": float(beta)
-                })
+                logs.append({"ticker": ticker, "column": col, "error_type": "non_stationary",
+                             "message": f"alpha+beta={alpha + beta:.4f} >= 1"})
                 continue
 
-            conditional_volatility = result.conditional_volatility
-            std_resid = result.resid / (conditional_volatility + 1e-8)
+            dynamic_threshold = t.ppf(1 - (confidence / 2), df=nu) if nu > 2 else 10.0
 
-            # Map standardized residuals back to original indices
-            # Returns correspond to indices [1, 2, ..., n-1] of valid_indices
-            # So std_resid[i] corresponds to valid_indices[i+1]
+            cond_vol = result.conditional_volatility
+            std_resid = result.resid / (cond_vol + 1e-8)
 
-            # Find outlier indices in returns space
-            outlier_mask_returns = numpy.abs(std_resid) > threshold
-            outlier_indices_returns = numpy.where(outlier_mask_returns)[0]
+            outlier_mask_returns = np.abs(std_resid) > dynamic_threshold
+            outlier_indices_returns = np.flatnonzero(outlier_mask_returns)
 
             if len(outlier_indices_returns) == 0:
                 continue
 
-            # Map back to original values array indices
-            # std_resid[i] corresponds to valid_indices[i+1]
             outlier_original_indices = valid_indices[outlier_indices_returns + 1]
 
-            # Impute outliers using cubic spline
-            for idx in outlier_original_indices:
-                original_value = float(values[idx])
-                std_resid_value = float(std_resid[numpy.where(valid_indices[1:] == idx)[0][0]]) if idx in valid_indices[1:] else None
+            # Build clean array for interpolation
+            clean_values_for_fit = col_values.copy()
+            clean_values_for_fit[outlier_original_indices] = np.nan
 
-                # Find valid neighbors for spline interpolation
-                prev_valid_indices = []
-                prev_valid_values = []
-                next_valid_indices = []
-                next_valid_values = []
+            clean_valid_mask = np.isfinite(clean_values_for_fit)
+            clean_valid_indices = np.flatnonzero(clean_valid_mask)
+            clean_valid_values = clean_values_for_fit[clean_valid_indices]
 
-                # Look backward for valid points
-                for i in range(idx - 1, -1, -1):
-                    if i in valid_indices and i not in outlier_original_indices:
-                        prev_valid_indices.append(i)
-                        prev_valid_values.append(values[i])
-                    if len(prev_valid_indices) >= 3:
-                        break
+            if len(clean_valid_indices) < 4:
+                continue
 
-                # Look forward for valid points
-                for i in range(idx + 1, len(values)):
-                    if i in valid_indices and i not in outlier_original_indices:
-                        next_valid_indices.append(i)
-                        next_valid_values.append(values[i])
-                    if len(next_valid_indices) >= 3:
-                        break
+            # Interpolation
+            try:
+                cs = CubicSpline(clean_valid_indices, clean_valid_values)
+                corrected_values_array = cs(outlier_original_indices)
+                method_used = "cubic_spline"
+            except Exception:
+                method_used = "fallback_nearest"
+                idx_in_valid = np.searchsorted(clean_valid_indices, outlier_original_indices).clip(0,
+                                                                                                   len(clean_valid_indices) - 1)
+                corrected_values_array = clean_valid_values[idx_in_valid]
 
-                # Combine for spline
-                spline_indices = prev_valid_indices[::-1] + next_valid_indices
-                spline_values = prev_valid_values[::-1] + next_valid_values
+            # Handle non-finite corrected values
+            non_finite_mask = ~np.isfinite(corrected_values_array)
+            if np.any(non_finite_mask):
+                for i in np.flatnonzero(non_finite_mask):
+                    idx = outlier_original_indices[i]
+                    nearest_idx = clean_valid_indices[np.abs(clean_valid_indices - idx).argmin()]
+                    corrected_values_array[i] = clean_values_for_fit[nearest_idx]
+                method_used = "last_valid_value_fallback"
 
-                if len(spline_indices) < 3:
-                    # Fallback to last valid value
-                    if prev_valid_values:
-                        corrected_value = prev_valid_values[0]
-                        method = 'last_valid_value'
-                    else:
-                        # Skip if no valid previous values
-                        if col_corrections_logged < MAX_CORRECTIONS_LOG:
-                            logs.append({
-                                "ticker": ticker,
-                                "date": dates[idx],
-                                "column": col,
-                                "error_type": "garch_outlier_skipped",
-                                "original_value": original_value,
-                                "standardized_residual": std_resid_value,
-                                "method": "skipped_no_valid_neighbors"
-                            })
-                            col_corrections_logged += 1
-                        continue
-                else:
-                    # Apply cubic spline interpolation
-                    spline = CubicSpline(spline_indices, spline_values)
-                    corrected_value = float(spline(idx))
-                    method = 'cubic_spline'
+            # Store original values before modification for logging
+            original_values = col_values[outlier_original_indices].copy()
 
-                    # Validate corrected value
-                    if not numpy.isfinite(corrected_value):
-                        corrected_value = prev_valid_values[0] if prev_valid_values else next_valid_values[0]
-                        method = 'last_valid_value_fallback'
+            # Batch update
+            col_values[outlier_original_indices] = corrected_values_array
+            modified_cols[col] = col_values
 
-                # Apply correction
-                values[idx] = corrected_value
+            # Vectorized logging (limited to MAX_CORRECTIONS_LOG)
+            n_to_log = min(len(outlier_original_indices), MAX_CORRECTIONS_LOG)
+            resid_vals = std_resid[outlier_indices_returns[:n_to_log]]
 
-                # Log correction
-                if col_corrections_logged < MAX_CORRECTIONS_LOG:
-                    logs.append({
-                        "ticker": ticker,
-                        "date": dates[idx],
-                        "column": col,
-                        "error_type": "garch_outlier",
-                        "original_value": original_value,
-                        "corrected_value": corrected_value,
-                        "standardized_residual": std_resid_value,
-                        "threshold": threshold,
-                        "alpha": float(alpha),
-                        "beta": float(beta),
-                        "method": method
-                    })
-                    col_corrections_logged += 1
+            logs.extend([
+                {
+                    "ticker": ticker,
+                    "date": dates[outlier_original_indices[i]],
+                    "column": col,
+                    "error_type": "garch_outlier",
+                    "original_value": float(original_values[i]),
+                    "corrected_value": float(corrected_values_array[i]),
+                    "standardized_residual": float(resid_vals[i]),
+                    "threshold": dynamic_threshold,
+                    "method": method_used
+                }
+                for i in range(n_to_log)
+            ])
 
-            # Restore original null positions
-            values[null_mask] = numpy.nan
-
-            # Update working dataframe with corrected column
-            working_df = working_df.with_columns(
-                polars.Series(name=col, values=values)
-            )
-
-        except Exception as exc:
-            logs.append({
-                "ticker": ticker,
-                "column": col,
-                "error_type": "garch_fit_error",
-                "message": str(exc)
-            })
+        except Exception as e:
+            logs.append({"ticker": ticker, "column": col, "error_type": "garch_error", "message": str(e)})
             continue
 
-    # Join corrected columns back to original lazy frame
-    corrected_cols_df = working_df.select(available_cols)
+    # Single DataFrame update at the end
+    if modified_cols:
+        working_df = working_df.with_columns([
+            pl.Series(name=col, values=arr) for col, arr in modified_cols.items()
+        ])
 
+    # Simplified join using row indices
     result_lf = (
         df.lazy()
         .sort(date_col)
         .with_row_index("_join_idx")
         .drop(available_cols)
         .join(
-            corrected_cols_df.lazy().with_row_index("_join_idx"),
+            working_df.select(available_cols).lazy().with_row_index("_join_idx"),
             on="_join_idx",
             how="left"
         )
         .drop("_join_idx")
     )
 
-    if is_lazy:
-        return result_lf, logs
-    else:
-        return result_lf.collect(), logs
+    return result_lf if is_lazy else result_lf.collect(), logs

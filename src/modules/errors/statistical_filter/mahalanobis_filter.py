@@ -92,7 +92,7 @@ def mahalanobis_filter(
 
     try:
         # Fit ONCE
-        mcd = MinCovDet(random_state=42)
+        mcd = MinCovDet(random_state=1)
         mcd.fit(training_matrix)
 
         # Get the Precision Matrix (Inverse Covariance)
