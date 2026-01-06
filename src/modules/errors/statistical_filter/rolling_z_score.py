@@ -6,6 +6,7 @@ from scipy.interpolate import CubicSpline
 
 def rolling_z_score(
     df: Union[polars.DataFrame, polars.LazyFrame],
+    metadata: polars.LazyFrame,
     ticker: str,
     columns: list[str],
     date_col: str = "m_date",

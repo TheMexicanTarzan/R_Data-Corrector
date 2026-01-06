@@ -7,6 +7,7 @@ from scipy.interpolate import CubicSpline
 
 def sort_dates(
         df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str],
         date_col: str = "m_date",
@@ -177,6 +178,7 @@ def sort_dates(
 
 def fill_negatives_fundamentals(
         df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         columns: list[str],
         ticker: str,
         date_col: str = 'm_date'
@@ -249,6 +251,7 @@ def fill_negatives_fundamentals(
 
 def fill_negatives_market(
         df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str],
         date_col: str = 'm_date'
@@ -414,6 +417,7 @@ def fill_negatives_market(
 
 def zero_wipeout(
         df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         columns: list[str],
         ticker: str,
         date_col: str = 'm_date'
@@ -492,6 +496,7 @@ def zero_wipeout(
 
 def mkt_cap_scale_error(
         df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str] = [""],
         date_col: str = 'm_date',
@@ -615,6 +620,7 @@ def mkt_cap_scale_error(
 
 def ohlc_integrity(
     df: Union[polars.DataFrame, polars.LazyFrame],
+    metadata: polars.LazyFrame,
     ticker: str,
     columns: list[str] = [""],  # for backward compatibility, useless but do not eliminate
     date_col: str = "m_date",
@@ -872,6 +878,7 @@ def ohlc_integrity(
 
 def validate_financial_equivalencies(
     df: Union[polars.DataFrame, polars.LazyFrame],
+    metadata: polars.LazyFrame,
     ticker: str,
     columns: list[str] = [""],
     date_col: str = "m_date",
@@ -1281,6 +1288,7 @@ def validate_financial_equivalencies(
 
 def validate_market_split_consistency(
     df: Union[polars.DataFrame, polars.LazyFrame],
+    metadata: polars.LazyFrame,
     ticker: str,
     columns: list[str] = [""],
     date_col: str = "m_date",
