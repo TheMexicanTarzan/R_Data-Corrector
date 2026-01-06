@@ -1,22 +1,22 @@
-import polars as pl
-import numpy as np
+import polars
+import numpy
 from typing import Union
 from scipy.interpolate import CubicSpline
 
 
 def mad_filter(
-        df: Union[pl.DataFrame, pl.LazyFrame],
-        metadata: pl.LazyFrame,
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str],
         date_col: str = "m_date",
         confidence: float = 0.01
-) -> tuple[Union[pl.DataFrame, pl.LazyFrame], list[dict]]:
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Detect and correct outliers using Modified Z-score (Optimized).
     """
     # 1. Setup & Validation
-    is_lazy = isinstance(df, pl.LazyFrame)
+    is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
 
     schema_cols = set(working_lf.collect_schema().names())
@@ -47,8 +47,8 @@ def mad_filter(
         # -- Step A: Calculate Stats in Polars (Fast) --
         # We need median and MAD. Polars handles nulls automatically in aggregations.
         stats = working_df.select([
-            pl.col(col).median().alias("median"),
-            (pl.col(col) - pl.col(col).median()).abs().median().alias("mad")
+            polars.col(col).median().alias("median"),
+            (polars.col(col) - polars.col(col).median()).abs().median().alias("mad")
         ])
 
         median_val = stats["median"][0]
@@ -67,16 +67,16 @@ def mad_filter(
 
         # -- Step B: Calculate Z-Scores Vectorized --
         # Get the column as a writable numpy array (Fix for read-only error)
-        col_values = working_df[col].to_numpy().astype(np.float64).copy()
+        col_values = working_df[col].to_numpy().astype(numpy.float64).copy()
 
         # Calculate Mod_Z = 0.6745 * (x - median) / MAD
-        # Use np.errstate to suppress warnings for NaNs (which we handle later)
-        with np.errstate(invalid='ignore', divide='ignore'):
+        # Use numpy.errstate to suppress warnings for NaNs (which we handle later)
+        with numpy.errstate(invalid='ignore', divide='ignore'):
             mod_z_scores = consistency_constant * (col_values - median_val) / mad_val
 
         # Identify outliers: |Z| > 3.5 AND value is not NaN
-        outlier_mask = (np.abs(mod_z_scores) > threshold) & np.isfinite(col_values)
-        outlier_indices = np.where(outlier_mask)[0]
+        outlier_mask = (numpy.abs(mod_z_scores) > threshold) & numpy.isfinite(col_values)
+        outlier_indices = numpy.where(outlier_mask)[0]
 
         if len(outlier_indices) == 0:
             continue
@@ -87,10 +87,10 @@ def mad_filter(
 
         # 1. Create a clean Y vector for training
         clean_values_for_fit = col_values.copy()
-        clean_values_for_fit[outlier_mask] = np.nan
+        clean_values_for_fit[outlier_mask] = numpy.nan
 
         # 2. Get valid X (indices) and Y (values)
-        valid_indices = np.where(np.isfinite(clean_values_for_fit))[0]
+        valid_indices = numpy.where(numpy.isfinite(clean_values_for_fit))[0]
         valid_values = clean_values_for_fit[valid_indices]
 
         # We need at least 4 points to fit a Cubic Spline comfortably
@@ -108,8 +108,8 @@ def mad_filter(
             method_used = "fallback_nearest"
             # Vectorized nearest neighbor lookup
             # Find index in valid_indices closest to each outlier index
-            idx_in_valid = np.searchsorted(valid_indices, outlier_indices)
-            idx_in_valid = np.clip(idx_in_valid, 0, len(valid_indices) - 1)
+            idx_in_valid = numpy.searchsorted(valid_indices, outlier_indices)
+            idx_in_valid = numpy.clip(idx_in_valid, 0, len(valid_indices) - 1)
             corrected_values_array = valid_values[idx_in_valid]
 
         col_corrections_logged = 0
@@ -121,9 +121,9 @@ def mad_filter(
             z_score_val = float(mod_z_scores[idx])
 
             # Validation: Splines can sometimes shoot to infinity
-            if not np.isfinite(new_val):
+            if not numpy.isfinite(new_val):
                 # Fallback to simple nearest valid value
-                nearest_idx = valid_indices[np.abs(valid_indices - idx).argmin()]
+                nearest_idx = valid_indices[numpy.abs(valid_indices - idx).argmin()]
                 new_val = float(clean_values_for_fit[nearest_idx])
                 method_used = "last_valid_value_fallback"
 
@@ -149,7 +149,7 @@ def mad_filter(
 
         # -- Step E: Update DataFrame --
         working_df = working_df.with_columns(
-            pl.Series(name=col, values=col_values)
+            polars.Series(name=col, values=col_values)
         )
 
     # 4. Join Back to LazyFrame (Standard Pattern)

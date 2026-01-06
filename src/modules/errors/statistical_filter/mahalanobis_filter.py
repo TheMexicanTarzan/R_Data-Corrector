@@ -1,23 +1,23 @@
-import polars as pl
-import numpy as np
+import polars
+import numpy
 from typing import Union
 from sklearn.covariance import MinCovDet
 from scipy.stats import chi2
 
 
 def mahalanobis_filter(
-        df: Union[pl.DataFrame, pl.LazyFrame],
-        metadata: pl.LazyFrame,
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str],
         date_col: str = "m_date",
         confidence: float = 0.01
-) -> tuple[Union[pl.DataFrame, pl.LazyFrame], list[dict]]:
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Detect outliers using Pooled Robust Covariance (Highly Optimized).
     """
     # 1. Setup (Same as before)
-    is_lazy = isinstance(df, pl.LazyFrame)
+    is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
     logs = []
     MAX_CORRECTIONS_LOG = 50
@@ -35,11 +35,11 @@ def mahalanobis_filter(
     if metadata is None: return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     try:
-        meta_df = metadata.filter(pl.col("ticker") == ticker).select("sector").collect()
+        meta_df = metadata.filter(polars.col("ticker") == ticker).select("sector").collect()
         if meta_df.is_empty() or meta_df["sector"][0] is None:
             return (working_lf.collect() if not is_lazy else working_lf, logs)
         target_sector = meta_df["sector"][0]
-        peer_tickers = metadata.filter(pl.col("sector") == target_sector).select("ticker").collect()["ticker"].to_list()
+        peer_tickers = metadata.filter(polars.col("sector") == target_sector).select("ticker").collect()["ticker"].to_list()
     except Exception:
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
@@ -53,23 +53,23 @@ def mahalanobis_filter(
     z_score_exprs = []
     for col in available_cols:
         # Median per quarter
-        median_expr = pl.col(col).median().over("_quarter")
+        median_expr = polars.col(col).median().over("_quarter")
         # MAD per quarter
-        mad_expr = (pl.col(col) - median_expr).abs().median().over("_quarter") * MAD_FACTOR
+        mad_expr = (polars.col(col) - median_expr).abs().median().over("_quarter") * MAD_FACTOR
         # Robust Z-score (add epsilon to avoid div by zero)
-        z_expr = ((pl.col(col) - median_expr) / (mad_expr + 1e-8)).alias(f"_z_{col}")
+        z_expr = ((polars.col(col) - median_expr) / (mad_expr + 1e-8)).alias(f"_z_{col}")
         z_score_exprs.append(z_expr)
 
     # Materialize the Z-score matrix
     # Filter for peers, generate quarters, calculate Z-scores immediately
     subset_df = (
         working_lf
-        .filter(pl.col("ticker").is_in(peer_tickers))
+        .filter(polars.col("ticker").is_in(peer_tickers))
         .select(["ticker", date_col] + available_cols)
         .sort(date_col)
         .with_columns(
-            (pl.col(date_col).dt.year().cast(pl.Utf8) + "-" +
-             pl.col(date_col).dt.quarter().cast(pl.Utf8)).alias("_quarter")
+            (polars.col(date_col).dt.year().cast(polars.Utf8) + "-" +
+             polars.col(date_col).dt.quarter().cast(polars.Utf8)).alias("_quarter")
         )
         .with_columns(z_score_exprs)  # <--- Calculation happens here in Rust
         .collect()
@@ -109,7 +109,7 @@ def mahalanobis_filter(
     # 5. Calculate Distances for Target Ticker (Vectorized)
 
     # Filter down to just our target ticker to score it
-    target_df = subset_df.filter(pl.col("ticker") == ticker)
+    target_df = subset_df.filter(polars.col("ticker") == ticker)
     if target_df.is_empty(): return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     # Extract target Z-scores
@@ -117,12 +117,12 @@ def mahalanobis_filter(
 
     # Handle NaNs in target (can't score them)
     # Create mask of rows that are fully valid
-    valid_mask = np.isfinite(target_z_matrix).all(axis=1)
+    valid_mask = numpy.isfinite(target_z_matrix).all(axis=1)
 
     # Initialize distances array with NaNs
-    distances_sq = np.full(len(target_df), np.nan)
+    distances_sq = numpy.full(len(target_df), numpy.nan)
 
-    if np.any(valid_mask):
+    if numpy.any(valid_mask):
         # Vectorized Mahalanobis Calculation:
         # (X - mu)
         diff = target_z_matrix[valid_mask] - robust_location
@@ -130,7 +130,7 @@ def mahalanobis_filter(
         left_term = diff @ robust_precision
         # ((X - mu) @ S^-1) * (X - mu) -> Sum over columns -> D^2
         # This is the diagonal of the full matrix multiplication
-        dist_sq_valid = np.sum(left_term * diff, axis=1)
+        dist_sq_valid = numpy.sum(left_term * diff, axis=1)
 
         distances_sq[valid_mask] = dist_sq_valid
 
@@ -138,8 +138,8 @@ def mahalanobis_filter(
     chi2_threshold = chi2.ppf(1 - confidence, df=len(available_cols))
 
     # Identify violating indices (local to target_df)
-    # Use np.greater with where to safely handle NaNs (NaN > thresh is False)
-    violating_indices = np.where(np.greater(distances_sq, chi2_threshold, where=np.isfinite(distances_sq)))[0]
+    # Use numpy.greater with where to safely handle NaNs (NaN > thresh is False)
+    violating_indices = numpy.where(numpy.greater(distances_sq, chi2_threshold, where=numpy.isfinite(distances_sq)))[0]
 
     violating_quarters = set()
 
@@ -182,9 +182,9 @@ def mahalanobis_filter(
     replacement_exprs = []
     for col in available_cols:
         expr = (
-            pl.when(pl.col("_quarter").is_in(violating_quarters))
+            polars.when(polars.col("_quarter").is_in(violating_quarters))
             .then(None)
-            .otherwise(pl.col(col))
+            .otherwise(polars.col(col))
             .forward_fill()
             .shift(1)
             .alias(f"{col}_replacement")
@@ -203,11 +203,11 @@ def mahalanobis_filter(
 
     final_cols = []
     for col in available_cols:
-        cond = pl.col("_quarter").is_in(violating_quarters) & pl.col(f"{col}_replacement").is_not_null()
+        cond = polars.col("_quarter").is_in(violating_quarters) & polars.col(f"{col}_replacement").is_not_null()
         final_cols.append(
-            pl.when(cond)
-            .then(pl.col(f"{col}_replacement"))
-            .otherwise(pl.col(col))
+            polars.when(cond)
+            .then(polars.col(f"{col}_replacement"))
+            .otherwise(polars.col(col))
             .alias(col)
         )
 

@@ -1,5 +1,5 @@
-import polars as pl
-import numpy as np
+import polars
+import numpy
 from typing import Union
 from scipy.interpolate import CubicSpline
 from scipy.stats import t
@@ -7,17 +7,17 @@ from arch import arch_model
 
 
 def garch_residuals(
-        df: Union[pl.DataFrame, pl.LazyFrame],
-        metadata: pl.LazyFrame,
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str],
         date_col: str = "m_date",
         confidence: float = 0.01
-) -> tuple[Union[pl.DataFrame, pl.LazyFrame], list[dict]]:
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Detect and correct outliers using GARCH(1,1) (Performance Optimized).
     """
-    is_lazy = isinstance(df, pl.LazyFrame)
+    is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
 
     schema_cols = set(working_lf.collect_schema().names())
@@ -38,15 +38,15 @@ def garch_residuals(
     dates = working_df[date_col].to_list()
 
     # Pre-extract all columns as numpy arrays upfront
-    col_arrays = {col: working_df[col].to_numpy().astype(np.float64, copy=True)
+    col_arrays = {col: working_df[col].to_numpy().astype(numpy.float64, copy=True)
                   for col in available_cols}
 
     modified_cols = {}
 
     for col in available_cols:
         col_values = col_arrays[col]
-        valid_mask = np.isfinite(col_values)
-        valid_indices = np.flatnonzero(valid_mask)
+        valid_mask = numpy.isfinite(col_values)
+        valid_indices = numpy.flatnonzero(valid_mask)
 
         if len(valid_indices) < 100:
             logs.append({"ticker": ticker, "column": col, "error_type": "insufficient_data",
@@ -56,11 +56,11 @@ def garch_residuals(
         valid_values = col_values[valid_indices]
 
         # Vectorized returns calculation with suppressed warnings
-        with np.errstate(divide='ignore', invalid='ignore'):
-            returns = np.diff(valid_values) / valid_values[:-1] * 100
-        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+        with numpy.errstate(divide='ignore', invalid='ignore'):
+            returns = numpy.diff(valid_values) / valid_values[:-1] * 100
+        returns = numpy.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if len(returns) < 100 or np.std(returns) < 1e-6:
+        if len(returns) < 100 or numpy.std(returns) < 1e-6:
             continue
 
         try:
@@ -83,8 +83,8 @@ def garch_residuals(
             cond_vol = result.conditional_volatility
             std_resid = result.resid / (cond_vol + 1e-8)
 
-            outlier_mask_returns = np.abs(std_resid) > dynamic_threshold
-            outlier_indices_returns = np.flatnonzero(outlier_mask_returns)
+            outlier_mask_returns = numpy.abs(std_resid) > dynamic_threshold
+            outlier_indices_returns = numpy.flatnonzero(outlier_mask_returns)
 
             if len(outlier_indices_returns) == 0:
                 continue
@@ -93,10 +93,10 @@ def garch_residuals(
 
             # Build clean array for interpolation
             clean_values_for_fit = col_values.copy()
-            clean_values_for_fit[outlier_original_indices] = np.nan
+            clean_values_for_fit[outlier_original_indices] = numpy.nan
 
-            clean_valid_mask = np.isfinite(clean_values_for_fit)
-            clean_valid_indices = np.flatnonzero(clean_valid_mask)
+            clean_valid_mask = numpy.isfinite(clean_values_for_fit)
+            clean_valid_indices = numpy.flatnonzero(clean_valid_mask)
             clean_valid_values = clean_values_for_fit[clean_valid_indices]
 
             if len(clean_valid_indices) < 4:
@@ -109,16 +109,16 @@ def garch_residuals(
                 method_used = "cubic_spline"
             except Exception:
                 method_used = "fallback_nearest"
-                idx_in_valid = np.searchsorted(clean_valid_indices, outlier_original_indices).clip(0,
+                idx_in_valid = numpy.searchsorted(clean_valid_indices, outlier_original_indices).clip(0,
                                                                                                    len(clean_valid_indices) - 1)
                 corrected_values_array = clean_valid_values[idx_in_valid]
 
             # Handle non-finite corrected values
-            non_finite_mask = ~np.isfinite(corrected_values_array)
-            if np.any(non_finite_mask):
-                for i in np.flatnonzero(non_finite_mask):
+            non_finite_mask = ~numpy.isfinite(corrected_values_array)
+            if numpy.any(non_finite_mask):
+                for i in numpy.flatnonzero(non_finite_mask):
                     idx = outlier_original_indices[i]
-                    nearest_idx = clean_valid_indices[np.abs(clean_valid_indices - idx).argmin()]
+                    nearest_idx = clean_valid_indices[numpy.abs(clean_valid_indices - idx).argmin()]
                     corrected_values_array[i] = clean_values_for_fit[nearest_idx]
                 method_used = "last_valid_value_fallback"
 
@@ -155,7 +155,7 @@ def garch_residuals(
     # Single DataFrame update at the end
     if modified_cols:
         working_df = working_df.with_columns([
-            pl.Series(name=col, values=arr) for col, arr in modified_cols.items()
+            polars.Series(name=col, values=arr) for col, arr in modified_cols.items()
         ])
 
     # Simplified join using row indices

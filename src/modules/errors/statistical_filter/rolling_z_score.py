@@ -1,21 +1,21 @@
-import polars as pl
-import numpy as np
+import polars
+import numpy
 from typing import Union
 from scipy.interpolate import CubicSpline
 
 
 def rolling_z_score(
-        df: Union[pl.DataFrame, pl.LazyFrame],
-        metadata: pl.LazyFrame,
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str],
         date_col: str = "m_date",
         confidence: float = 0.01
-) -> tuple[Union[pl.DataFrame, pl.LazyFrame], list[dict]]:
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Detect and correct outliers using Adaptive Rolling Statistics (Optimized).
     """
-    is_lazy = isinstance(df, pl.LazyFrame)
+    is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
 
     # Get schema to check column existence
@@ -63,9 +63,9 @@ def rolling_z_score(
         # shift(1) ensures we don't include current time t in the window (Look-forward bias prevention)
         # rolling_mean/std are optimized Polars ops.
         stats = working_df.select([
-            pl.col(col),
-            pl.col(col).shift(1).rolling_mean(window_size, min_periods=min_periods).alias("mean"),
-            pl.col(col).shift(1).rolling_std(window_size, min_periods=min_periods).alias("std")
+            polars.col(col),
+            polars.col(col).shift(1).rolling_mean(window_size, min_periods=min_periods).alias("mean"),
+            polars.col(col).shift(1).rolling_std(window_size, min_periods=min_periods).alias("std")
         ])
 
         # Calculate Z-scores vectors
@@ -75,15 +75,15 @@ def rolling_z_score(
         rolling_std = stats["std"].to_numpy()
 
         # Avoid division by zero or NaN issues
-        with np.errstate(invalid='ignore', divide='ignore'):
+        with numpy.errstate(invalid='ignore', divide='ignore'):
             z_scores = (col_values - rolling_mean) / rolling_std
 
         # Create masks
-        valid_stats_mask = np.isfinite(rolling_mean) & (rolling_std > 0)
+        valid_stats_mask = numpy.isfinite(rolling_mean) & (rolling_std > 0)
         # Outliers: |Z| > threshold AND valid stats existed
-        outlier_mask = (np.abs(z_scores) > threshold) & valid_stats_mask & np.isfinite(col_values)
+        outlier_mask = (numpy.abs(z_scores) > threshold) & valid_stats_mask & numpy.isfinite(col_values)
 
-        outlier_indices = np.where(outlier_mask)[0]
+        outlier_indices = numpy.where(outlier_mask)[0]
 
         if len(outlier_indices) == 0:
             continue
@@ -94,10 +94,10 @@ def rolling_z_score(
         # Mask outliers in the data to treat them as missing for the spline
         # Original logic: "valid_mask_for_spline = numpy.isfinite(values) & ~outlier_mask"
         clean_values_for_fit = col_values.copy()
-        clean_values_for_fit[outlier_mask] = np.nan
+        clean_values_for_fit[outlier_mask] = numpy.nan
 
         # Get indices of valid data for training the spline
-        valid_indices = np.where(np.isfinite(clean_values_for_fit))[0]
+        valid_indices = numpy.where(numpy.isfinite(clean_values_for_fit))[0]
         valid_values = clean_values_for_fit[valid_indices]
 
         # Use Scipy CubicSpline on ALL valid data
@@ -111,7 +111,7 @@ def rolling_z_score(
             except Exception:
                 # Fallback if spline fails (e.g. strict geometric issues)
                 method_used = "fallback_nearest"
-                corrected_values = [valid_values[np.abs(valid_indices - idx).argmin()] for idx in outlier_indices]
+                corrected_values = [valid_values[numpy.abs(valid_indices - idx).argmin()] for idx in outlier_indices]
         else:
             # Not enough data to interpolate
             continue
@@ -125,9 +125,9 @@ def rolling_z_score(
             new_val = float(corrected_values[i])
 
             # Validation: ensure we didn't generate a NaN or infinity
-            if not np.isfinite(new_val):
+            if not numpy.isfinite(new_val):
                 # Fallback to nearest valid
-                nearest_idx = valid_indices[np.abs(valid_indices - idx).argmin()]
+                nearest_idx = valid_indices[numpy.abs(valid_indices - idx).argmin()]
                 new_val = float(clean_values_for_fit[nearest_idx])
                 method_used = "last_valid_value_fallback"
 
@@ -154,7 +154,7 @@ def rolling_z_score(
 
         # Update the column in the working DataFrame
         working_df = working_df.with_columns(
-            pl.Series(name=col, values=col_values)
+            polars.Series(name=col, values=col_values)
         )
 
     # 5. Join back to original structure
