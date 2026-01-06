@@ -148,8 +148,8 @@ def garch_residuals(
                 })
                 continue
 
-            # Get standardized residuals
-            std_resid = result.std_resid
+            conditional_volatility = result.conditional_volatility
+            std_resid = result.resid / (conditional_volatility + 1e-8)
 
             # Map standardized residuals back to original indices
             # Returns correspond to indices [1, 2, ..., n-1] of valid_indices

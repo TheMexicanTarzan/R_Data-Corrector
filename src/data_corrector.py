@@ -175,7 +175,7 @@ if __name__ == "__main__":
         )
 
         # Consolidate audit logs to remove empty entries from parallel processing
-        logs_sanity_check = {
+        logs = {
             "unsorted_dates_logs": consolidate_audit_logs(unsorted_dates_logs),
             "negative_fundamentals_logs": consolidate_audit_logs(negative_fundamentals_logs),
             "negative_market_logs": consolidate_audit_logs(negative_market_logs),
@@ -189,7 +189,7 @@ if __name__ == "__main__":
         with open(output_logs_directory / "sanity_check" / "error_logs" / 'logs_sanity_check.json', 'w') as f:
             json.dump(logs, f, indent=4, default=str)
 
-        return dataframe_dict_clean_split_consistency, logs_sanity_check
+        return dataframe_dict_clean_split_consistency, logs
 
     def run_full_statistical_filter():
         # 1. Rolling Statistics (20-60 Day Window)
@@ -371,7 +371,7 @@ if __name__ == "__main__":
         return dataframe_dict_clean_garch, logs
 
 
-    clean_lfs, logs = run_full_sanity_check()
+    # clean_lfs, logs = run_full_sanity_check()
 
     clean_lfs, logs = run_full_statistical_filter()
 
