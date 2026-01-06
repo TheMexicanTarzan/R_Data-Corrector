@@ -1,176 +1,416 @@
-import polars as pl
-import numpy as np
-from numba import jit
+import polars
+import numpy
+from typing import Union
+from sklearn.covariance import MinCovDet
+from scipy.stats import chi2
 
-@jit(nopython=True)
-def add_double_mad_outliers(
-        df: pl.DataFrame,
-        columns: list[str],
-        window_size: int = 30,
-        threshold: float = 3.0
-) -> pl.DataFrame:
+
+def mahalanobis_filter(
+    df: Union[polars.DataFrame, polars.LazyFrame],
+    metadata: polars.LazyFrame,
+    ticker: str,
+    columns: list[str],
+    date_col: str = "m_date",
+    confidence: float = 0.01
+) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
-    Applies a Rolling Double MAD filter to flag outliers in specified columns.
+    Detect and correct outliers using Cross-Sectional Multivariate Outlier Detection.
+
+    This filter uses Mahalanobis distance with a robust covariance estimator (MinCovDet)
+    to identify multivariate outliers in quarterly fundamental data. The analysis is
+    performed cross-sectionally within the same sector peer group.
+
+    Process:
+        1. Filter df to include all tickers sharing the same sector as the target ticker
+        2. Downsample daily data to quarterly (last valid entry per quarter)
+        3. Fit MinCovDet to estimate robust covariance and mean
+        4. Calculate Mahalanobis Distance D²_M for the target ticker's quarterly points
+        5. Flag quarters where D²_M > χ²(p, 0.99)
+        6. Broadcast flags to all daily entries within violating quarters
+        7. Forward-fill entire violating quarter with last valid observation from previous quarter
 
     Args:
-        df: Input Polars DataFrame.
-        columns: List of column names to filter.
-        window_size: Size of the rolling window.
-        threshold: The Z-score threshold to flag outliers (default 3.0).
+        df: Input DataFrame or LazyFrame containing daily data for the ENTIRE universe
+            of tickers. Must contain a "ticker" column to identify different securities.
+        metadata: LazyFrame containing metadata with at least "ticker" and "sector" columns.
+        ticker: Target ticker symbol to analyze and correct.
+        columns: List of column names (fundamentals) to include in multivariate analysis.
+        date_col: Name of the date column (default: 'm_date').
+        confidence: Confidence level for chi-square threshold (default: 0.01 for 99%).
 
     Returns:
-        DataFrame with new columns "{col}_outlier" (Boolean).
+        tuple containing:
+            - Corrected DataFrame/LazyFrame (same type as input) - only target ticker's
+              data is modified
+            - List of dictionaries documenting each correction made
     """
+    is_lazy = isinstance(df, polars.LazyFrame)
+    working_lf = df if is_lazy else df.lazy()
 
-    # 1. Define the specific Double MAD logic optimized for a 1D numpy array
-    def _double_mad_window(arr: np.ndarray) -> bool:
-        # Calculate the median of the current window
-        median = np.median(arr)
+    # Get schema to check column existence
+    schema_cols = set(working_lf.collect_schema().names())
 
-        # Current value (last element in the rolling window)
-        current_val = arr[-1]
+    # Initialize logs
+    logs = []
+    MAX_CORRECTIONS_LOG = 50
 
-        if current_val == median:
-            return False
+    # Validate required columns
+    if date_col not in schema_cols:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "missing_date_column",
+            "message": f"Date column '{date_col}' not found in dataframe"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
 
-        # Split window into Left (<= median) and Right (>= median)
-        # We perform absolute deviation calculation immediately
-        abs_dev = np.abs(arr - median)
+    if "ticker" not in schema_cols:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "missing_ticker_column",
+            "message": "Ticker column not found in dataframe"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
 
-        left_mask = arr <= median
-        right_mask = arr >= median
+    # Check metadata for sector information
+    if metadata is None:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "missing_metadata",
+            "message": "Metadata not provided, cannot determine sector peer group"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
 
-        # Calculate MAD for left and right tails
-        # We add a tiny epsilon (1e-6) to prevent division by zero
-        left_mad = np.median(abs_dev[left_mask])
-        if left_mad == 0: left_mad = 1e-6
+    metadata_schema = metadata.collect_schema()
+    if "sector" not in metadata_schema.names():
+        logs.append({
+            "ticker": ticker,
+            "error_type": "missing_sector_column",
+            "message": "Sector column not found in metadata"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
 
-        right_mad = np.median(abs_dev[right_mask])
-        if right_mad == 0: right_mad = 1e-6
+    # Filter available analysis columns
+    available_cols = [col for col in columns if col in schema_cols]
 
-        # Standard consistency constant for Gaussian distribution
-        k = 1.4826
+    if len(available_cols) < 2:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "insufficient_columns",
+            "message": f"Need at least 2 columns for multivariate analysis, found {len(available_cols)}"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
 
-        # Calculate Double MAD Z-score based on which side the current value falls
-        if current_val < median:
-            score = abs(current_val - median) / (left_mad * k)
-        else:
-            score = abs(current_val - median) / (right_mad * k)
-
-        return score > threshold
-
-    # 2. Construct the expression list
-    # We use pl.Boolean for memory optimality (1 bit/byte vs 64 bits for floats)
-    exprs = [
-        pl.col(col)
-        .rolling(window_size=window_size)
-        .map_elements(_double_mad_window, return_dtype=pl.Boolean)
-        .alias(f"{col}_outlier")
-        for col in columns
-    ]
-
-    # 3. Apply efficiently
-    return df.with_columns(exprs)
-
-
-import polars as pl
-import numpy as np
-import numba
-
-
-@numba.jit(nopython=True)
-def _run_adaptive_kalman(values, flags, r_normal, r_outlier, q_process):
-    n = len(values)
-
-    # State Vector: [position, velocity]
-    # We initialize position at the first value, velocity at 0
-    x_est = values[0]
-    v_est = 0.0
-
-    # Error Covariance Matrix (2x2)
-    # P00 = pos_var, P01 = cov, P10 = cov, P11 = vel_var
-    p00, p01, p10, p11 = 1.0, 0.0, 0.0, 1.0
-
-    # Output array
-    smoothed = np.empty(n)
-    smoothed[0] = x_est
-
-    # Kalman Loop
-    for i in range(1, n):
-        # 1. PREDICTION STEP (A * x)
-        # Assuming constant velocity model (dt = 1)
-        x_pred = x_est + v_est
-        v_pred = v_est
-
-        # Predict Covariance (A * P * A.T + Q)
-        # Q is process noise (uncertainty in the model)
-        p00_pred = p00 + p10 + p01 + p11 + q_process
-        p01_pred = p01 + p11
-        p10_pred = p10 + p11
-        p11_pred = p11 + q_process
-
-        # 2. DECIDE R (Measurement Noise)
-        # If flagged, R is huge (ignore measurement). If valid, R is small.
-        current_r = r_outlier if flags[i] else r_normal
-
-        # 3. UPDATE STEP
-        measurement = values[i]
-
-        # Innovation (residual)
-        y = measurement - x_pred
-
-        # Innovation Covariance (S = H * P * H.T + R)
-        # H is [1, 0] because we only measure position
-        s = p00_pred + current_r
-
-        # Kalman Gain (K = P * H.T * S^-1)
-        k0 = p00_pred / s
-        k1 = p10_pred / s
-
-        # Update State
-        x_est = x_pred + k0 * y
-        v_est = v_pred + k1 * y
-
-        # Update Covariance (P = (I - K * H) * P)
-        # We manually expand matrix multiplication for speed
-        p00 = p00_pred * (1 - k0)
-        p01 = p01_pred * (1 - k0)
-        p10 = -k1 * p00_pred + p10_pred
-        p11 = -k1 * p01_pred + p11_pred
-
-        smoothed[i] = x_est
-
-    return smoothed
-
-
-def smooth_flagged_data(
-        df: pl.DataFrame,
-        value_col: str,
-        flag_col: str,
-        R_normal: float = 0.1,
-        R_outlier: float = 100000.0,
-        Q: float = 0.01
-) -> pl.DataFrame:
-    """
-    Applies an adaptive Kalman filter that ignores flagged outliers.
-
-    Args:
-        df: Polars DataFrame
-        value_col: Column with raw data
-        flag_col: Boolean column (True = Outlier)
-        R_normal: Noise assumption for valid data (lower = follow data closer)
-        R_outlier: Noise assumption for outliers (must be very high)
-        Q: Process noise (allowance for true changes in velocity)
-    """
-
-    # Extract arrays
-    vals = df[value_col].to_numpy().astype(np.float64)
-    # Ensure flags are boolean (handles 1/0 or True/False)
-    flags = df[flag_col].to_numpy().astype(bool)
-
-    # Run optimized Numba filter
-    smoothed_vals = _run_adaptive_kalman(vals, flags, R_normal, R_outlier, Q)
-
-    return df.with_columns(
-        pl.Series(f"{value_col}_smoothed", smoothed_vals)
+    # Get target ticker's sector from metadata
+    target_sector_df = (
+        metadata
+        .filter(polars.col("ticker") == ticker)
+        .select("sector")
+        .limit(1)
+        .collect()
     )
+
+    if target_sector_df.is_empty():
+        logs.append({
+            "ticker": ticker,
+            "error_type": "ticker_not_in_metadata",
+            "message": f"Ticker '{ticker}' not found in metadata"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
+
+    target_sector = target_sector_df["sector"][0]
+
+    if target_sector is None:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "null_sector",
+            "message": f"Sector is null for ticker '{ticker}'"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
+
+    # Get all tickers in the same sector
+    peer_tickers_df = (
+        metadata
+        .filter(polars.col("sector") == target_sector)
+        .select("ticker")
+        .collect()
+    )
+
+    peer_tickers = peer_tickers_df["ticker"].to_list()
+
+    if len(peer_tickers) < 5:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "insufficient_peers",
+            "message": f"Only {len(peer_tickers)} peers in sector '{target_sector}', need at least 5"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
+
+    # Filter df to include only peer tickers
+    select_cols = ["ticker", date_col] + available_cols
+    peer_df = (
+        working_lf
+        .filter(polars.col("ticker").is_in(peer_tickers))
+        .select(select_cols)
+        .collect()
+    )
+
+    if peer_df.is_empty():
+        logs.append({
+            "ticker": ticker,
+            "error_type": "no_peer_data",
+            "message": "No data found for peer tickers"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
+
+    # Add quarter column for downsampling
+    # Quarter format: YYYY-Q
+    peer_df = peer_df.with_columns(
+        (
+            polars.col(date_col).dt.year().cast(polars.Utf8) +
+            polars.lit("-Q") +
+            polars.col(date_col).dt.quarter().cast(polars.Utf8)
+        ).alias("_quarter")
+    )
+
+    # Downsample to quarterly: last valid entry per (ticker, quarter)
+    # First sort by date, then take last row per group
+    quarterly_df = (
+        peer_df
+        .sort(date_col)
+        .group_by(["ticker", "_quarter"])
+        .last()
+    )
+
+    # Get unique quarters for analysis
+    unique_quarters = quarterly_df["_quarter"].unique().sort().to_list()
+
+    if len(unique_quarters) < 4:
+        logs.append({
+            "ticker": ticker,
+            "error_type": "insufficient_quarters",
+            "message": f"Only {len(unique_quarters)} quarters available, need at least 4"
+        })
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
+
+    # Chi-square threshold at specified confidence level
+    p = len(available_cols)  # Number of dimensions
+    chi2_threshold = chi2.ppf(1 - confidence, df=p)
+
+    # Track violating quarters for the target ticker
+    violating_quarters = []
+    col_corrections_logged = 0
+
+    # Analyze each quarter cross-sectionally
+    for quarter in unique_quarters:
+        # Get cross-sectional data for this quarter
+        quarter_data = quarterly_df.filter(polars.col("_quarter") == quarter)
+
+        # Extract numeric data for MCD
+        data_matrix = quarter_data.select(available_cols).to_numpy()
+
+        # Remove rows with any NaN
+        valid_mask = ~numpy.isnan(data_matrix).any(axis=1)
+        valid_data = data_matrix[valid_mask]
+        valid_tickers = quarter_data.filter(
+            polars.Series(valid_mask)
+        )["ticker"].to_list()
+
+        if len(valid_data) < len(available_cols) + 2:
+            # Not enough observations for MCD estimation
+            continue
+
+        # Check if target ticker is in this quarter's data
+        if ticker not in valid_tickers:
+            continue
+
+        target_idx = valid_tickers.index(ticker)
+        target_observation = valid_data[target_idx].reshape(1, -1)
+
+        try:
+            # Fit MinCovDet for robust estimation
+            mcd = MinCovDet(random_state=42)
+            mcd.fit(valid_data)
+
+            # Get robust location and covariance
+            robust_mean = mcd.location_
+            robust_cov = mcd.covariance_
+
+            # Calculate Mahalanobis distance for target ticker
+            # D² = (x - μ)ᵀ Σ⁻¹ (x - μ)
+            diff = target_observation - robust_mean
+            inv_cov = numpy.linalg.inv(robust_cov)
+            mahal_dist_sq = float(diff @ inv_cov @ diff.T)
+
+            # Check against chi-square threshold
+            if mahal_dist_sq > chi2_threshold:
+                violating_quarters.append({
+                    "quarter": quarter,
+                    "mahalanobis_distance_sq": mahal_dist_sq,
+                    "threshold": chi2_threshold,
+                    "observation": {col: float(target_observation[0, i])
+                                    for i, col in enumerate(available_cols)}
+                })
+
+                if col_corrections_logged < MAX_CORRECTIONS_LOG:
+                    logs.append({
+                        "ticker": ticker,
+                        "quarter": quarter,
+                        "error_type": "mahalanobis_outlier",
+                        "mahalanobis_distance_sq": mahal_dist_sq,
+                        "chi2_threshold": chi2_threshold,
+                        "dimensions": p,
+                        "confidence_level": 1 - confidence,
+                        "num_peers": len(valid_tickers),
+                        "sector": target_sector
+                    })
+                    col_corrections_logged += 1
+
+        except Exception as exc:
+            logs.append({
+                "ticker": ticker,
+                "quarter": quarter,
+                "error_type": "mcd_fit_error",
+                "message": str(exc)
+            })
+            continue
+
+    if not violating_quarters:
+        # No outliers found, return original data
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
+
+    # Now impute the violating quarters for the target ticker
+    # Extract target ticker's daily data
+    target_daily_df = (
+        working_lf
+        .filter(polars.col("ticker") == ticker)
+        .sort(date_col)
+        .collect()
+    )
+
+    if target_daily_df.is_empty():
+        result_df = working_lf if is_lazy else working_lf.collect()
+        return (result_df, logs)
+
+    # Add quarter column to target daily data
+    target_daily_df = target_daily_df.with_columns(
+        (
+            polars.col(date_col).dt.year().cast(polars.Utf8) +
+            polars.lit("-Q") +
+            polars.col(date_col).dt.quarter().cast(polars.Utf8)
+        ).alias("_quarter")
+    )
+
+    # Get violating quarter strings
+    violating_quarter_strs = [vq["quarter"] for vq in violating_quarters]
+
+    # For each violating quarter, find the last valid observation from previous quarter
+    dates = target_daily_df[date_col].to_list()
+    quarters = target_daily_df["_quarter"].to_list()
+
+    # Create numpy arrays for each column to modify
+    column_arrays = {}
+    for col in available_cols:
+        column_arrays[col] = target_daily_df[col].to_numpy().astype(numpy.float64)
+
+    # Sort quarters to find previous valid quarter
+    sorted_quarters = sorted(set(quarters))
+    quarter_to_prev_valid = {}
+
+    for i, q in enumerate(sorted_quarters):
+        if q in violating_quarter_strs:
+            # Find the most recent non-violating quarter before this one
+            prev_valid_quarter = None
+            for j in range(i - 1, -1, -1):
+                if sorted_quarters[j] not in violating_quarter_strs:
+                    prev_valid_quarter = sorted_quarters[j]
+                    break
+            quarter_to_prev_valid[q] = prev_valid_quarter
+
+    # For each violating quarter, get last observation from previous valid quarter
+    for vq in violating_quarter_strs:
+        prev_quarter = quarter_to_prev_valid.get(vq)
+
+        if prev_quarter is None:
+            # No previous valid quarter available
+            logs.append({
+                "ticker": ticker,
+                "quarter": vq,
+                "error_type": "no_previous_valid_quarter",
+                "message": "Cannot impute: no valid quarter before violating quarter"
+            })
+            continue
+
+        # Find indices for violating quarter
+        violating_indices = [i for i, q in enumerate(quarters) if q == vq]
+
+        # Find the last observation from previous valid quarter
+        prev_quarter_indices = [i for i, q in enumerate(quarters) if q == prev_quarter]
+
+        if not prev_quarter_indices:
+            continue
+
+        last_valid_idx = prev_quarter_indices[-1]
+
+        # Forward-fill: replace all values in violating quarter with last valid value
+        for col in available_cols:
+            last_valid_value = column_arrays[col][last_valid_idx]
+
+            if not numpy.isfinite(last_valid_value):
+                # Last value of previous quarter is null, try to find any valid value
+                for idx in reversed(prev_quarter_indices):
+                    if numpy.isfinite(column_arrays[col][idx]):
+                        last_valid_value = column_arrays[col][idx]
+                        break
+
+            if numpy.isfinite(last_valid_value):
+                for idx in violating_indices:
+                    original_value = column_arrays[col][idx]
+                    column_arrays[col][idx] = last_valid_value
+
+                    if col_corrections_logged < MAX_CORRECTIONS_LOG and idx == violating_indices[0]:
+                        logs.append({
+                            "ticker": ticker,
+                            "date": dates[idx],
+                            "quarter": vq,
+                            "column": col,
+                            "error_type": "mahalanobis_imputation",
+                            "original_value": float(original_value) if numpy.isfinite(original_value) else None,
+                            "corrected_value": float(last_valid_value),
+                            "source_quarter": prev_quarter,
+                            "method": "forward_fill_quarter"
+                        })
+                        col_corrections_logged += 1
+
+    # Update target daily dataframe with corrected columns
+    for col in available_cols:
+        target_daily_df = target_daily_df.with_columns(
+            polars.Series(name=col, values=column_arrays[col])
+        )
+
+    # Remove the _quarter helper column
+    target_daily_df = target_daily_df.drop("_quarter")
+
+    # Merge corrected target data back into full dataset
+    # Remove original target ticker data and append corrected version
+    other_tickers_lf = working_lf.filter(polars.col("ticker") != ticker)
+
+    result_lf = polars.concat([
+        other_tickers_lf,
+        target_daily_df.lazy()
+    ])
+
+    if is_lazy:
+        return result_lf, logs
+    else:
+        return result_lf.collect(), logs
