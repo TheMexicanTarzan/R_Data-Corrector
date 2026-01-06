@@ -156,7 +156,7 @@ def process_single_ticker(lf: polars.LazyFrame,
 
 
 def parallel_process_tickers(
-        data_dict: dict[str, polars.LazyFrame],
+        data_dict: dict[str, tuple[polars.LazyFrame, polars.LazyFrame]],
         columns: list[str] = [""],
         function: Callable = None,
         max_workers: int = 8,

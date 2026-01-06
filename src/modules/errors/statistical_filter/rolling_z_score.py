@@ -6,7 +6,6 @@ from scipy.interpolate import CubicSpline
 
 def rolling_z_score(
     df: Union[polars.DataFrame, polars.LazyFrame],
-    metadata: polars.LazyFrame,
     ticker: str,
     columns: list[str],
     date_col: str = "m_date",
@@ -20,11 +19,11 @@ def rolling_z_score(
     look-forward bias).
 
     The rolling Z-score is calculated as:
-        Z_t = (x_t - ¼_{t-1}) / Ã_{t-1}
+        Z_t = (x_t - mean_{t-1}) / std_{t-1}
 
     where:
-        ¼_{t-1} = rolling mean over [t-window, t-1]
-        Ã_{t-1} = rolling std over [t-window, t-1]
+        mean_{t-1} = rolling mean over [t-window, t-1]
+        std_{t-1} = rolling std over [t-window, t-1]
 
     Threshold: Observations are flagged if |Z_t| > k, where k defaults to 3.5
     if not derived from confidence level.

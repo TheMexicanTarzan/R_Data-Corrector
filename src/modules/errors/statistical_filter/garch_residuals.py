@@ -17,13 +17,10 @@ def garch_residuals(
     Detect and correct outliers using GARCH(1,1) volatility clustering.
 
     Fits a GARCH(1,1) model with Student's T-distribution to handle fat tails.
-    Calculates standardized residuals z_t = µ_t / Ã_t and flags observations
+    Calculates standardized residuals and flags observations
     where |z_t| > 3.5. Flagged values are imputed using cubic spline interpolation.
 
-    The GARCH(1,1) model:
-        Ã²_t = É + ± * µ²_{t-1} + ² * Ã²_{t-1}
-
-    Constraint: Ensures ± + ² < 1 for stationarity.
+    Constraint: Ensures alpha + beta < 1 for stationarity.
 
     Args:
         df: Input DataFrame or LazyFrame containing market data for a single ticker.
