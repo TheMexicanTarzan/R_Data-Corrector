@@ -1,9 +1,8 @@
 from pathlib import Path
 import logging
-import polars
 import json
 
-from src.input_handlers.csv_reader import read_csv_files_to_polars
+from src.input_handlers import read_csv_files_to_polars
 from src.modules.errors.sanity_check import (
     sort_dates,
     fill_negatives_fundamentals,
@@ -20,8 +19,8 @@ from src.modules.errors.statistical_filter import (
     mad_filter,
     rolling_z_score
 )
-from src.features.lazy_parallelization import parallel_process_tickers, consolidate_audit_logs
-from src.dashboard.dashboard import run_dashboard
+from src.features import parallel_process_tickers, consolidate_audit_logs
+from src.dashboard import run_dashboard
 
 current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
