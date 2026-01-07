@@ -29,6 +29,9 @@ def mahalanobis_filter(
     logs = []
     MAX_CORRECTIONS_LOG = 50
 
+    # Clean ticker name (remove .csv extension if present)
+    ticker_symbol = ticker.replace(".csv", "") if ticker.endswith(".csv") else ticker
+
     # Basic validations
     schema_cols = set(working_lf.collect_schema().names())
     if date_col not in schema_cols:
@@ -54,11 +57,11 @@ def mahalanobis_filter(
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     try:
-        # Fix: metadata uses "symbol" column, not "ticker"
-        meta_df = metadata.filter(polars.col("symbol") == ticker).select("sector").collect()
+        # Use ticker_symbol (without .csv) to match metadata's "symbol" column
+        meta_df = metadata.filter(polars.col("symbol") == ticker_symbol).select("sector").collect()
         if meta_df.is_empty() or meta_df["sector"][0] is None:
             logs.append({"ticker": ticker, "error_type": "no_sector",
-                         "message": "Ticker not found in metadata or has no sector"})
+                         "message": f"Ticker '{ticker_symbol}' not found in metadata or has no sector"})
             return (working_lf.collect() if not is_lazy else working_lf, logs)
         target_sector = meta_df["sector"][0]
 
@@ -165,10 +168,10 @@ def mahalanobis_filter(
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     # 6. Calculate Distances for Target Ticker (Vectorized)
-    target_df = subset_df.filter(polars.col("ticker") == ticker)
+    target_df = subset_df.filter(polars.col("ticker") == ticker_symbol)
     if target_df.is_empty():
         logs.append({"ticker": ticker, "error_type": "no_target_data",
-                     "message": "Target ticker not found in pooled data"})
+                     "message": f"Target ticker '{ticker_symbol}' not found in pooled data"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     # Extract target Z-scores
