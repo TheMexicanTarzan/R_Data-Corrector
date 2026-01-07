@@ -26,13 +26,14 @@ current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
 output_logs_directory = current_dir / ".." / "Output"
 batch_size = 512
+max_files = 7000
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 if __name__ == "__main__":
-    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=500)
+    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=max_files)
 
     # MEMORY FIX: Don't pre-collect all originals - store file paths for on-demand loading
     # The dashboard will load originals lazily when needed for visualization
@@ -355,7 +356,7 @@ if __name__ == "__main__":
             columns=garch_cols,
             function=garch_residuals,
             batch_size=batch_size,
-            max_workers=1
+            max_workers=1 # Arch library already uses multithreading
         )
 
         logs ={
@@ -365,7 +366,7 @@ if __name__ == "__main__":
             "mad_filter": mad_logs
         }
 
-        with open(output_logs_directory / "statistical_filter" / "error_logs" / 'logs_sanity_check.json', 'w') as f:
+        with open(output_logs_directory / "statistical_filter" / "error_logs" / 'logs_statistical_filter.json', 'w') as f:
             json.dump(logs, f, indent=4, default=str)
 
         return dataframe_dict_clean_garch, logs

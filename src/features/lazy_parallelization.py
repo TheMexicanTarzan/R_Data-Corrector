@@ -217,7 +217,8 @@ def parallel_process_tickers(
         batch_tickers = ticker_keys[batch_start:batch_end]
 
         logger.info(f"Processing batch {batch_start // batch_size + 1}: "
-                    f"tickers {batch_start} to {batch_end - 1} ({len(batch_tickers)} tickers)")
+                    f"tickers {batch_start} to {batch_end - 1} ({len(batch_tickers)} tickers)"
+                    f"function: {str(function)}")
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_ticker = {}
