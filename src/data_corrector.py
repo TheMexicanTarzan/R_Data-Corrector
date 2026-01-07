@@ -341,7 +341,8 @@ if __name__ == "__main__":
             data_dict=dataframe_dict_clean_rolling,
             columns=mahalanobis_cols,
             function=mahalanobis_filter,
-            batch_size=batch_size
+            batch_size=batch_size,
+            shared_data=dataframe_dict_clean_rolling  # Pass all ticker data for cross-sectional peer analysis
         )
 
         dataframe_dict_clean_mad, mad_logs = parallel_process_tickers(

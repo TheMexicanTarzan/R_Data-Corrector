@@ -145,7 +145,8 @@ def process_single_ticker(lf: polars.LazyFrame,
                           columns: list[str],
                           ticker: str,
                           function: Callable,
-                          metadata: polars.LazyFrame = None) -> tuple[polars.LazyFrame, list[dict]]:
+                          metadata: polars.LazyFrame = None,
+                          shared_data: dict = None) -> tuple[polars.LazyFrame, list[dict]]:
     """
     Process a single ticker file through any cleaning function.
 
@@ -155,16 +156,17 @@ def process_single_ticker(lf: polars.LazyFrame,
         ticker: Ticker symbol
         function: Validation/cleaning function to apply
         metadata: Optional LazyFrame containing metadata (e.g., sector information)
+        shared_data: Optional dict containing data from all tickers (for cross-sectional analysis)
 
     Returns:
-        Tuple of (ticker, cleaned_lazyframe, audit_log)
+        Tuple of (ticker, cleaned_lazyframe, audit_log, metadata)
     """
 
     # Apply cleaning functions in sequence
-    # Pass metadata if the function signature supports it
-    lf, audit = function(df=lf, columns=columns, ticker=ticker, metadata=metadata)
+    # Pass metadata and shared_data if the function signature supports it
+    lf, audit = function(df=lf, columns=columns, ticker=ticker, metadata=metadata, shared_data=shared_data)
 
-    return ticker, lf, audit
+    return ticker, lf, audit, metadata
 
 
 def parallel_process_tickers(
@@ -174,8 +176,9 @@ def parallel_process_tickers(
         max_workers: int = 8,
         batch_size: int = None,
         show_progress: bool = True,
-        max_logs_per_ticker: int = MAX_LOGS_PER_TICKER
-) -> tuple[dict[str, polars.LazyFrame], list[dict]]:
+        max_logs_per_ticker: int = MAX_LOGS_PER_TICKER,
+        shared_data: dict = None
+) -> tuple[dict[str, tuple[polars.LazyFrame, polars.LazyFrame]], list[dict]]:
     """
     Parallelize the processing of multiple tickers using threading.
     Threading works well with Polars since it releases the GIL.
@@ -193,9 +196,11 @@ def parallel_process_tickers(
         batch_size: Number of tickers per batch
         show_progress: Whether to show progress bar
         max_logs_per_ticker: Maximum log entries per ticker (default: MAX_LOGS_PER_TICKER)
+        shared_data: Optional dict containing data from all tickers (for cross-sectional analysis)
 
     Returns:
         Tuple of (cleaned_lazyframes_dict, all_audit_logs_list)
+        - cleaned_lazyframes_dict preserves (LazyFrame, metadata) tuples
     """
     total_tickers = len(data_dict)
     cleaned_lazyframes = {}
@@ -241,7 +246,8 @@ def parallel_process_tickers(
                     columns,
                     ticker,
                     function,
-                    metadata
+                    metadata,
+                    shared_data
                 )
                 future_to_ticker[future] = ticker
             # --- END TUPLE HANDLING ---
@@ -254,8 +260,9 @@ def parallel_process_tickers(
             for future in iterator:
                 ticker = future_to_ticker[future]
                 try:
-                    returned_ticker, cleaned_lf, audit_log = future.result()
-                    cleaned_lazyframes[returned_ticker] = cleaned_lf
+                    returned_ticker, cleaned_lf, audit_log, returned_metadata = future.result()
+                    # Preserve metadata tuple for downstream filters
+                    cleaned_lazyframes[returned_ticker] = (cleaned_lf, returned_metadata)
 
                     # MEMORY FIX: Truncate logs per ticker for fair distribution
                     original_size = get_log_size(audit_log)

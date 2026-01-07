@@ -111,7 +111,8 @@ def garch_residuals(
         ticker: str,
         columns: list[str],
         date_col: str = "m_date",
-        confidence: float = 0.001
+        confidence: float = 0.001,
+        shared_data: dict = None  # Unused - for interface consistency with cross-sectional filters
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Detect and correct outliers using GARCH(1,1) (Numba Optimized).

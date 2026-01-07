@@ -200,14 +200,10 @@ def read_csv_files_to_polars(
                 ]
                 frame = frame.with_columns(date_expressions)
 
-            # --- PART B: Process Metadata ---
-            # Create a LazyFrame specific to this ticker
-            ticker_metadata = full_metadata_lf.filter(
-                polars.col("symbol") == ticker_symbol
-            )
-
-            # --- PART C: Store Result ---
-            results[filename] = (frame, ticker_metadata)
+            # --- PART B: Store Result with Full Metadata ---
+            # Pass the full metadata LazyFrame so filters can query peer tickers
+            # (e.g., mahalanobis_filter needs to find all tickers in the same sector)
+            results[filename] = (frame, full_metadata_lf)
 
         except Exception as e:
             print(f"Error processing {filename}: {e}")

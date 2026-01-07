@@ -11,12 +11,19 @@ def mahalanobis_filter(
         ticker: str,
         columns: list[str],
         date_col: str = "m_date",
-        confidence: float = 0.01
+        confidence: float = 0.01,
+        shared_data: dict = None  # Required for cross-sectional peer analysis
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Detect outliers using Pooled Robust Covariance (Highly Optimized).
+
+    This filter performs cross-sectional analysis by comparing the target ticker
+    against its sector peers. It requires:
+    - metadata: Full metadata LazyFrame to identify peer tickers in the same sector
+    - shared_data: Dict mapping ticker symbols to (LazyFrame, metadata) tuples
+                   for accessing peer ticker data
     """
-    # 1. Setup (Same as before)
+    # 1. Setup
     is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
     logs = []
@@ -25,33 +32,86 @@ def mahalanobis_filter(
     # Basic validations
     schema_cols = set(working_lf.collect_schema().names())
     if date_col not in schema_cols:
-        return (working_lf.collect() if not is_lazy else working_lf, logs)  # Error log omitted for brevity
+        logs.append({"ticker": ticker, "error_type": "missing_date_col",
+                     "message": f"Date column '{date_col}' not found"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     available_cols = [col for col in columns if col in schema_cols]
     if len(available_cols) < 2:
-        return (working_lf.collect() if not is_lazy else working_lf, logs)  # Error log omitted
-
-    # 2. Peer Identification (Same as before)
-    if metadata is None: return (working_lf.collect() if not is_lazy else working_lf, logs)
-
-    try:
-        meta_df = metadata.filter(polars.col("ticker") == ticker).select("sector").collect()
-        if meta_df.is_empty() or meta_df["sector"][0] is None:
-            return (working_lf.collect() if not is_lazy else working_lf, logs)
-        target_sector = meta_df["sector"][0]
-        peer_tickers = metadata.filter(polars.col("sector") == target_sector).select("ticker").collect()["ticker"].to_list()
-    except Exception:
+        logs.append({"ticker": ticker, "error_type": "insufficient_cols",
+                     "message": f"Need at least 2 columns, found {len(available_cols)}"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # 3. Data Prep: Calculate Robust Z-Scores via Window Functions
-    # Instead of iterating, we do all math in Polars engines
+    # 2. Peer Identification - requires both metadata and shared_data
+    if metadata is None:
+        logs.append({"ticker": ticker, "error_type": "missing_metadata",
+                     "message": "Metadata is required for cross-sectional analysis"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # Calculate MAD constant: 1 / Q3(Standard Normal) approx 1.4826
+    if shared_data is None:
+        logs.append({"ticker": ticker, "error_type": "missing_shared_data",
+                     "message": "shared_data is required for peer comparison"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
+
+    try:
+        # Fix: metadata uses "symbol" column, not "ticker"
+        meta_df = metadata.filter(polars.col("symbol") == ticker).select("sector").collect()
+        if meta_df.is_empty() or meta_df["sector"][0] is None:
+            logs.append({"ticker": ticker, "error_type": "no_sector",
+                         "message": "Ticker not found in metadata or has no sector"})
+            return (working_lf.collect() if not is_lazy else working_lf, logs)
+        target_sector = meta_df["sector"][0]
+
+        # Get all peer ticker symbols in the same sector
+        peer_symbols = metadata.filter(polars.col("sector") == target_sector).select("symbol").collect()["symbol"].to_list()
+    except Exception as e:
+        logs.append({"ticker": ticker, "error_type": "metadata_error", "message": str(e)})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
+
+    # 3. Collect Peer Data from shared_data
+    # shared_data maps filename (e.g., "AAPL.csv") to (LazyFrame, metadata) tuples
+    peer_frames = []
+    for filename, payload in shared_data.items():
+        # Extract ticker symbol from filename (e.g., "AAPL.csv" -> "AAPL")
+        symbol = filename.replace(".csv", "")
+        if symbol in peer_symbols:
+            # Extract the LazyFrame from the tuple
+            if isinstance(payload, tuple):
+                peer_lf = payload[0]
+            else:
+                peer_lf = payload
+
+            # Select only needed columns and add ticker identifier
+            try:
+                peer_schema = set(peer_lf.collect_schema().names())
+                cols_to_select = [c for c in [date_col] + available_cols if c in peer_schema]
+                if len(cols_to_select) > 1:  # At least date + 1 data column
+                    peer_df = (
+                        peer_lf
+                        .select(cols_to_select)
+                        .with_columns(polars.lit(symbol).alias("ticker"))
+                        .collect()
+                    )
+                    peer_frames.append(peer_df)
+            except Exception:
+                continue  # Skip problematic tickers
+
+    if len(peer_frames) < 3:
+        logs.append({"ticker": ticker, "error_type": "insufficient_peers",
+                     "message": f"Only {len(peer_frames)} valid peers found, need at least 3"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
+
+    # Concatenate all peer data
+    pooled_df = polars.concat(peer_frames, how="diagonal")
+
+    # 4. Data Prep: Calculate Robust Z-Scores via Window Functions
     MAD_FACTOR = 1.4826
 
     # Define Expressions for Robust Standardization per Quarter
     z_score_exprs = []
     for col in available_cols:
+        if col not in pooled_df.columns:
+            continue
         # Median per quarter
         median_expr = polars.col(col).median().over("_quarter")
         # MAD per quarter
@@ -60,86 +120,80 @@ def mahalanobis_filter(
         z_expr = ((polars.col(col) - median_expr) / (mad_expr + 1e-8)).alias(f"_z_{col}")
         z_score_exprs.append(z_expr)
 
-    # Materialize the Z-score matrix
-    # Filter for peers, generate quarters, calculate Z-scores immediately
+    # Update available_cols to only those present in pooled data
+    available_cols = [col for col in available_cols if col in pooled_df.columns]
+    if len(available_cols) < 2:
+        logs.append({"ticker": ticker, "error_type": "insufficient_cols_after_pool",
+                     "message": "Not enough common columns across peers"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
+
+    # Generate quarter column and calculate Z-scores
     subset_df = (
-        working_lf
-        .filter(polars.col("ticker").is_in(peer_tickers))
-        .select(["ticker", date_col] + available_cols)
+        pooled_df
         .sort(date_col)
         .with_columns(
             (polars.col(date_col).dt.year().cast(polars.Utf8) + "-" +
              polars.col(date_col).dt.quarter().cast(polars.Utf8)).alias("_quarter")
         )
-        .with_columns(z_score_exprs)  # <--- Calculation happens here in Rust
-        .collect()
+        .with_columns(z_score_exprs)
     )
 
-    if subset_df.is_empty(): return (working_lf.collect() if not is_lazy else working_lf, logs)
+    if subset_df.is_empty():
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # 4. Fit Global Robust Covariance (Pooled Approach)
-    # We fit MinCovDet ONCE on the pooled Z-scores of the entire peer group history.
-
+    # 5. Fit Global Robust Covariance (Pooled Approach)
     z_cols = [f"_z_{c}" for c in available_cols]
 
     # Extract training data (all valid peers across all time)
-    # Drop nulls so Sklearn doesn't complain
     training_matrix = subset_df.select(z_cols).drop_nulls().to_numpy()
 
     # Validation: Need enough data for the fit
     if len(training_matrix) < len(available_cols) * 5:
+        logs.append({"ticker": ticker, "error_type": "insufficient_training_data",
+                     "message": f"Only {len(training_matrix)} rows, need {len(available_cols) * 5}"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     try:
-        # Fit ONCE
+        # Fit ONCE on all peer data
         mcd = MinCovDet(random_state=1)
         mcd.fit(training_matrix)
-
-        # Get the Precision Matrix (Inverse Covariance)
-        # We use this to calculate distance manually: D^2 = z * S^-1 * z.T
-        robust_precision = mcd.precision_  # Shape (k, k)
-
-        # We also get the location, though for Z-scores it should be near 0
-        robust_location = mcd.location_  # Shape (k,)
+        robust_precision = mcd.precision_
+        robust_location = mcd.location_
 
     except Exception as e:
         logs.append({"ticker": ticker, "error_type": "mcd_fit_error", "message": str(e)})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # 5. Calculate Distances for Target Ticker (Vectorized)
-
-    # Filter down to just our target ticker to score it
+    # 6. Calculate Distances for Target Ticker (Vectorized)
     target_df = subset_df.filter(polars.col("ticker") == ticker)
-    if target_df.is_empty(): return (working_lf.collect() if not is_lazy else working_lf, logs)
+    if target_df.is_empty():
+        logs.append({"ticker": ticker, "error_type": "no_target_data",
+                     "message": "Target ticker not found in pooled data"})
+        return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     # Extract target Z-scores
     target_z_matrix = target_df.select(z_cols).to_numpy()
 
     # Handle NaNs in target (can't score them)
-    # Create mask of rows that are fully valid
     valid_mask = numpy.isfinite(target_z_matrix).all(axis=1)
 
     # Initialize distances array with NaNs
     distances_sq = numpy.full(len(target_df), numpy.nan)
 
     if numpy.any(valid_mask):
-        # Vectorized Mahalanobis Calculation:
-        # (X - mu)
+        # Vectorized Mahalanobis Calculation
         diff = target_z_matrix[valid_mask] - robust_location
-        # (X - mu) @ S^-1
         left_term = diff @ robust_precision
-        # ((X - mu) @ S^-1) * (X - mu) -> Sum over columns -> D^2
-        # This is the diagonal of the full matrix multiplication
         dist_sq_valid = numpy.sum(left_term * diff, axis=1)
-
         distances_sq[valid_mask] = dist_sq_valid
 
-    # 6. Detect & Correct
+    # 7. Detect & Correct
     chi2_threshold = chi2.ppf(1 - confidence, df=len(available_cols))
 
-    # Identify violating indices (local to target_df)
-    # Use numpy.greater with where to safely handle NaNs (NaN > thresh is False)
-    violating_indices = numpy.where(numpy.greater(distances_sq, chi2_threshold, where=numpy.isfinite(distances_sq)))[0]
+    # Identify violating indices
+    violating_indices = numpy.where(
+        numpy.greater(distances_sq, chi2_threshold, where=numpy.isfinite(distances_sq))
+    )[0]
 
     violating_quarters = set()
 
@@ -151,7 +205,6 @@ def mahalanobis_filter(
             q = quarters[idx]
             dist = float(distances_sq[idx])
 
-            # Add to set for vectorized imputation
             violating_quarters.add(q)
 
             if len(logs) < MAX_CORRECTIONS_LOG:
@@ -161,15 +214,23 @@ def mahalanobis_filter(
                     "quarter": q,
                     "error_type": "mahalanobis_outlier",
                     "mahalanobis_distance_sq": dist,
-                    "threshold": chi2_threshold
+                    "threshold": chi2_threshold,
+                    "num_peers": len(peer_frames)
                 })
 
-    # 7. Imputation (Same Join-and-Switch Logic as before)
-    if not violating_quarters:
-        return (target_df.select(working_lf.columns).lazy() if is_lazy else target_df.select(working_lf.columns), logs)
+    # 8. Return Results
+    # Get the original columns from working_lf
+    original_cols = working_lf.collect_schema().names()
 
+    if not violating_quarters:
+        # No corrections needed - return original data
+        if is_lazy:
+            return working_lf, logs
+        else:
+            return working_lf.collect(), logs
+
+    # 9. Imputation for violating quarters
     # Downsample target to quarterly for imputation source
-    # We must operate on raw values, not Z-scores, for the fix
     target_quarterly_vals = (
         target_df
         .group_by("_quarter")
@@ -211,7 +272,11 @@ def mahalanobis_filter(
             .alias(col)
         )
 
-    result_df = corrected_df.with_columns(final_cols).select(working_lf.columns)
+    # Select only original columns that exist in corrected_df
+    result_cols = [c for c in original_cols if c in corrected_df.columns or c in [col for col in available_cols]]
+    result_df = corrected_df.with_columns(final_cols).select(
+        [c for c in original_cols if c in corrected_df.with_columns(final_cols).columns]
+    )
 
     if is_lazy:
         return result_df.lazy(), logs

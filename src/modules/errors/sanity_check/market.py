@@ -9,7 +9,8 @@ def fill_negatives_market(
         metadata: polars.LazyFrame,
         ticker: str,
         columns: list[str],
-        date_col: str = 'm_date'
+        date_col: str = 'm_date',
+        shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Detect and correct negative values in market data using backward-looking cubic spline.
@@ -176,6 +177,7 @@ def ohlc_integrity(
     ticker: str,
     columns: list[str] = [""],  # for backward compatibility, useless but do not eliminate
     date_col: str = "m_date",
+    shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Validate and resolve OHLC data integrity issues:
@@ -435,7 +437,8 @@ def validate_market_split_consistency(
     ticker: str,
     columns: list[str] = [""],
     date_col: str = "m_date",
-    tolerance: float = 0.01
+    tolerance: float = 0.01,
+    shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Validate that the relationship between raw market data and split-adjusted market data

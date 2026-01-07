@@ -10,6 +10,7 @@ def sort_dates(
         columns: list[str],
         date_col: str = "m_date",
         dedupe_strategy: Literal["earliest", "latest", "all"] = "all",
+        shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Sort a polars DataFrame or LazyFrame by date columns with a defined hierarchy.
@@ -179,7 +180,8 @@ def fill_negatives_fundamentals(
         metadata: polars.LazyFrame,
         columns: list[str],
         ticker: str,
-        date_col: str = 'm_date'
+        date_col: str = 'm_date',
+        shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict[str, list[dict]]]:
     """
     Replaces negative values in specified columns with the last non-negative value.
@@ -252,7 +254,8 @@ def zero_wipeout(
         metadata: polars.LazyFrame,
         columns: list[str],
         ticker: str,
-        date_col: str = 'm_date'
+        date_col: str = 'm_date',
+        shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Identifies rows where share columns are 0 AND 'm_volume' > 0.
@@ -333,7 +336,8 @@ def mkt_cap_scale_error(
         columns: list[str] = [""],
         date_col: str = 'm_date',
         market_cap_col: str = 'c_market_cap',
-        shares_outstanding_col: str = 'fis_weighted_average_diluted_shares_outstanding'
+        shares_outstanding_col: str = 'fis_weighted_average_diluted_shares_outstanding',
+        shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Identifies and corrects rows where share columns jump by 10x or more
@@ -456,7 +460,8 @@ def validate_financial_equivalencies(
     ticker: str,
     columns: list[str] = [""],
     date_col: str = "m_date",
-    tolerance: float = 0.05
+    tolerance: float = 0.05,
+    shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict]:
     """
     Validate and clean financial statement data by enforcing accounting identities.
