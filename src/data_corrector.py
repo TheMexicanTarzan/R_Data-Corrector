@@ -24,6 +24,7 @@ from src.dashboard import run_dashboard
 
 current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
+metadata_path = current_dir / ".." / "Input" / "Universe_Information" / "Universe_Information.csv"
 output_logs_directory = current_dir / ".." / "Output"
 batch_size = 512
 max_files = 7000
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 if __name__ == "__main__":
-    dataframe_dict = read_csv_files_to_polars(data_directory, max_files=max_files)
+    dataframe_dict = read_csv_files_to_polars(data_directory, metadata_path=metadata_path, max_files=max_files)
 
     # MEMORY FIX: Don't pre-collect all originals - store file paths for on-demand loading
     # The dashboard will load originals lazily when needed for visualization

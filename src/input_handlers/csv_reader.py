@@ -1,10 +1,15 @@
 import polars
 import os
 import glob
+from pathlib import Path
 from typing import Union, Optional, Tuple
 
-data_dir = "../../Input/Data"
-metadata_dir = "../../Input/Universe_Information/Universe_Information.csv"
+# Get the directory where this module is located
+_MODULE_DIR = Path(__file__).parent.resolve()
+# Default paths relative to the project root (assuming src/input_handlers/ structure)
+_PROJECT_ROOT = _MODULE_DIR.parent.parent
+data_dir = str(_PROJECT_ROOT / "Input" / "Data")
+metadata_dir = str(_PROJECT_ROOT / "Input" / "Universe_Information" / "Universe_Information.csv")
 
 # ============================================================================
 # 1. DEFINE SCHEMAS
