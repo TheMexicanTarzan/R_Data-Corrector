@@ -27,7 +27,7 @@ data_directory = current_dir / ".." / "Input" / "Data"
 metadata_path = current_dir / ".." / "Input" / "Universe_Information" / "Universe_Information.csv"
 output_logs_directory = current_dir / ".." / "Output"
 batch_size = 512
-max_files = 7000
+max_files = 200
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
