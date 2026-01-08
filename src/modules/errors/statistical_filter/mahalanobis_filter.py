@@ -2,8 +2,9 @@ import polars as pl
 import numpy as np
 import scipy.linalg
 import threading
+import warnings
 from typing import Union, Optional
-from sklearn.covariance import MinCovDet
+from sklearn.covariance import MinCovDet, LedoitWolf
 from scipy.stats import chi2
 
 
@@ -191,7 +192,10 @@ def _train_mcd_model(
         valid_cols: list[str]
 ) -> Optional[dict]:
     """
-    Train MCD (Minimum Covariance Determinant) model on normalized sector data.
+    Train robust covariance model on normalized sector data.
+
+    Uses MCD (Minimum Covariance Determinant) as primary estimator with
+    LedoitWolf shrinkage as fallback for numerical stability issues.
 
     Returns dict with robust_loc, robust_prec, or None if training fails.
     """
@@ -201,23 +205,49 @@ def _train_mcd_model(
     if len(training_matrix) < len(valid_cols) * 5:
         return None
 
+    robust_cov = None
+    robust_loc = None
+
+    # Try MCD first, catch determinant warnings and fall back to LedoitWolf
     try:
-        mcd = MinCovDet(random_state=42, support_fraction=0.9, assume_centered=False)
-        mcd.fit(training_matrix)
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
 
-        robust_cov = mcd.covariance_
-        robust_loc = mcd.location_
+            mcd = MinCovDet(random_state=42, support_fraction=0.9, assume_centered=False)
+            mcd.fit(training_matrix)
 
-        # Regularize for safety (invertibility)
-        robust_cov.flat[::robust_cov.shape[0] + 1] += 1e-6
-        robust_prec = scipy.linalg.pinvh(robust_cov)
+            # Check if determinant warning was raised
+            determinant_warning = any(
+                "Determinant has increased" in str(w.message)
+                for w in caught_warnings
+            )
 
-        return {
-            "robust_loc": robust_loc,
-            "robust_prec": robust_prec
-        }
+            if not determinant_warning:
+                robust_cov = mcd.covariance_
+                robust_loc = mcd.location_
+
     except Exception:
-        return None
+        pass  # Will fall through to LedoitWolf
+
+    # Fallback to LedoitWolf if MCD failed or had numerical issues
+    if robust_cov is None:
+        try:
+            lw = LedoitWolf(assume_centered=False)
+            lw.fit(training_matrix)
+
+            robust_cov = lw.covariance_
+            robust_loc = lw.location_
+        except Exception:
+            return None
+
+    # Regularize diagonal for numerical stability (invertibility)
+    robust_cov.flat[::robust_cov.shape[0] + 1] += 1e-6
+    robust_prec = scipy.linalg.pinvh(robust_cov)
+
+    return {
+        "robust_loc": robust_loc,
+        "robust_prec": robust_prec
+    }
 
 
 def _compute_sector_model(
