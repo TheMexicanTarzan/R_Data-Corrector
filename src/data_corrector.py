@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def run_full_sanity_check(data: dict, save_data: bool, out_format: str, batch_size: int = 512) -> tuple[dict, dict]:
+def run_full_sanity_check(data: dict, save_data: bool, out_format: str, output_logs_directory, batch_size: int = 512) -> tuple[dict, dict]:
     date_cols = [
         "f_filing_date",
         "m_date",
@@ -196,7 +196,7 @@ def run_full_sanity_check(data: dict, save_data: bool, out_format: str, batch_si
 
     return dataframe_dict_clean_split_consistency, logs
 
-def run_full_statistical_filter(data: dict, save_data: bool, out_format: str, batch_size: int = 512) -> tuple[dict, dict]:
+def run_full_statistical_filter(data: dict, save_data: bool, out_format: str, output_logs_directory, batch_size: int = 512) -> tuple[dict, dict]:
     # 1. Rolling Statistics (20-60 Day Window)
     # Target: Time-Series Trends (Prices & Moving Averages)
     # These check against recent history (Mean +/- StdDev) to handle drift.
@@ -401,17 +401,17 @@ def run_full_statistical_filter(data: dict, save_data: bool, out_format: str, ba
     )
 
     logs ={
-        "rolling_z_score_filter": rolling_z_logs,
-        "mahalanobis_filter": mahalanobis_logs,
-        "garch_residuals_filter": garch_logs,
-        "mad_filter": mad_logs
+        "rolling_z_score_filter": consolidate_audit_logs(rolling_z_logs),
+        "mahalanobis_filter": consolidate_audit_logs(mahalanobis_logs),
+        "garch_residuals_filter": consolidate_audit_logs(garch_logs),
+        "mad_filter": consolidate_audit_logs(mad_logs)
     }
-
-    with open(output_logs_directory / "statistical_filter" / "error_logs" / 'logs_statistical_filter.json', 'w') as f:
-        json.dump(logs, f, indent=4, default=str)
 
     # Save corrected data if requested
     if save_data:
+        with open(output_logs_directory / "statistical_filter" / "error_logs" / 'logs_statistical_filter.json', 'w') as f:
+            json.dump(logs, f, indent=4, default=str)
+
         logger.info("Saving corrected data to CSV files...")
         output_data_directory = output_logs_directory / "statistical_filter" / "corrected_data"
         saved_files = save_corrected_data(
@@ -425,11 +425,27 @@ def run_full_statistical_filter(data: dict, save_data: bool, out_format: str, ba
 
     return dataframe_dict_clean_garch, logs
 
-def run_half_pipeline(data: dict, save_data: bool, out_format: str, batch_size: int = 512):
-    clean_lfs, logs = run_full_sanity_check(data, save_data = save_data, out_format=out_format, batch_size=batch_size)
-    clean_lfs, logs = run_full_statistical_filter(clean_lfs, save_data = save_data, out_format=out_format, batch_size=batch_size)
+def run_half_pipeline(data: dict, save_data: bool, out_format: str, output_logs_directory, batch_size: int = 512):
+    clean_lfs, sanity_logs = run_full_sanity_check(data,
+                                            save_data = not save_data,
+                                            out_format=out_format,
+                                            output_logs_directory=output_logs_directory,
+                                            batch_size=batch_size)
+    clean_lfs, stats_logs = run_full_statistical_filter(clean_lfs,
+                                                  save_data = not save_data,
+                                                  out_format=out_format,
+                                                  output_logs_directory=output_logs_directory,
+                                                  batch_size=batch_size)
+
 
     if save_data:
+        with open(output_logs_directory / "full_pipeline" / "error_logs" / 'logs_sanity_check.json', 'w') as f:
+            json.dump(sanity_logs, f, indent=4, default=str)
+
+        with open(output_logs_directory / "statistical_filter" / "error_logs" / 'logs_statistical_filter.json',
+                  'w') as f:
+            json.dump(stats_logs, f, indent=4, default=str)
+
         logger.info("Saving corrected data to CSV files...")
         output_data_directory = output_logs_directory / "statistical_filter" / "corrected_data"
         saved_files = save_corrected_data(
@@ -440,7 +456,9 @@ def run_half_pipeline(data: dict, save_data: bool, out_format: str, batch_size: 
             overwrite=True
         )
 
-    return clean_lfs, logs
+    logger.info(f"Successfully saved {len(saved_files)} corrected data files to {output_data_directory}")
+
+    return clean_lfs, stats_logs
 
 
 print("Data cleaning complete. Launching dashboard...")

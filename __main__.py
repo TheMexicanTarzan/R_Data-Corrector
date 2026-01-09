@@ -15,8 +15,8 @@ metadata_path = current_dir / "Input" / "Universe_Information" / "Universe_Infor
 output_logs_directory = current_dir / "Output"
 out_format = "csv"
 batch_size = 512
-max_files = 512
-save_data = False
+max_files = 5
+save_data = True
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +28,22 @@ original_file_paths = {
     ticker: data_directory / ticker for ticker in dataframe_dict.keys()
 }
 
-# clean_data_dict, logs = run_full_sanity_check(dataframe_dict, save_data=save_data)
-# clean_data_dict,logs = run_full_statistical_filter(clean_data_dict, save_data=save_data)
-clean_data_dict, logs = run_half_pipeline(dataframe_dict, save_data=save_data, out_format=out_format, batch_size=batch_size)
+# clean_data_dict, logs = run_full_sanity_check(dataframe_dict,
+#                                               save_data=save_data,
+#                                               out_format=out_format,
+#                                               output_logs_directory=output_logs_directory,
+#                                               batch_size=batch_size)
+
+clean_data_dict,logs = run_full_statistical_filter(dataframe_dict,
+                                                   save_data=save_data,
+                                                   out_format=out_format,
+                                                   output_logs_directory=output_logs_directory,
+                                                   batch_size=batch_size)
+
+# clean_data_dict, logs = run_half_pipeline(dataframe_dict,
+#                                           save_data=save_data,
+#                                           out_format=out_format,
+#                                           output_logs_directory=output_logs_directory,
+#                                           batch_size=batch_size)
+
 # run_dashboard(original_file_paths, clean_data_dict, logs, debug=False, port=8050)
