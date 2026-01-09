@@ -1,9 +1,302 @@
 import polars as pl
 import numpy as np
 import scipy.linalg
-from typing import Union
-from sklearn.covariance import MinCovDet
+import threading
+import warnings
+from typing import Union, Optional
+from sklearn.covariance import MinCovDet, LedoitWolf
 from scipy.stats import chi2
+
+
+class SectorModelCache:
+    """
+    Thread-safe cache for sector-level Mahalanobis models.
+
+    This cache stores pre-computed MCD models for each sector, avoiding
+    redundant computation when multiple tickers from the same sector
+    are processed in parallel.
+    """
+
+    def __init__(self):
+        self._cache = {}
+        self._lock = threading.Lock()
+        self._computing = {}  # Track sectors currently being computed
+
+    def get(self, sector: str) -> Optional[dict]:
+        """Get cached model for a sector (thread-safe)."""
+        with self._lock:
+            return self._cache.get(sector)
+
+    def set(self, sector: str, model: dict) -> None:
+        """Store model for a sector (thread-safe)."""
+        with self._lock:
+            self._cache[sector] = model
+            # Clear computing flag
+            if sector in self._computing:
+                del self._computing[sector]
+
+    def get_or_compute(self, sector: str, compute_fn) -> Optional[dict]:
+        """
+        Get cached model or compute it if not present.
+
+        Uses double-checked locking to ensure only one thread computes
+        the model while others wait.
+        """
+        # Fast path: check if already cached
+        model = self.get(sector)
+        if model is not None:
+            return model
+
+        # Slow path: need to potentially compute
+        with self._lock:
+            # Double-check after acquiring lock
+            if sector in self._cache:
+                return self._cache[sector]
+
+            # Check if another thread is computing
+            if sector in self._computing:
+                # Wait for the other thread by releasing and re-acquiring
+                event = self._computing[sector]
+            else:
+                # We'll compute it - create event for others to wait on
+                event = threading.Event()
+                self._computing[sector] = event
+                event = None  # Signal that we should compute
+
+        if event is not None:
+            # Another thread is computing - wait for it
+            event.wait(timeout=300)  # 5 minute timeout
+            return self.get(sector)
+
+        # We're the computing thread
+        try:
+            model = compute_fn()
+            if model is not None:
+                self.set(sector, model)
+            return model
+        finally:
+            # Signal completion to waiting threads
+            with self._lock:
+                if sector in self._computing:
+                    self._computing[sector].set()
+                    del self._computing[sector]
+
+    def clear(self) -> None:
+        """Clear all cached models."""
+        with self._lock:
+            self._cache.clear()
+
+    def __len__(self) -> int:
+        """Return number of cached sectors."""
+        with self._lock:
+            return len(self._cache)
+
+
+def _build_sector_quarterly_data(
+        peer_symbols: list[str],
+        available_cols: list[str],
+        date_col: str,
+        shared_data: dict
+) -> pl.DataFrame:
+    """
+    Build quarterly aggregated data for all peers in a sector.
+
+    This collects data from shared_data for all peer symbols and
+    collapses daily data to quarterly snapshots.
+    """
+    quarterly_frames = []
+
+    for filename, payload in shared_data.items():
+        # Skip the cache entry itself
+        if filename == "__sector_model_cache__":
+            continue
+
+        symbol = filename.replace(".csv", "")
+        if symbol in peer_symbols:
+            peer_lf = payload[0] if isinstance(payload, tuple) else payload
+            try:
+                peer_schema = set(peer_lf.collect_schema().names())
+                cols_curr = [c for c in [date_col] + available_cols if c in peer_schema]
+
+                # Must have date + at least 1 feature
+                if len(cols_curr) > 1:
+                    q_peer = (
+                        peer_lf
+                        .select(cols_curr)
+                        .with_columns([
+                            pl.lit(symbol).alias("ticker"),
+                            (pl.col(date_col).dt.year().cast(pl.Utf8) + "-" +
+                             pl.col(date_col).dt.quarter().cast(pl.Utf8)).alias("_quarter_id")
+                        ])
+                        .group_by(["ticker", "_quarter_id"])
+                        .agg([
+                            pl.col(date_col).last(),
+                            *[pl.col(c).last() for c in cols_curr if c != date_col]
+                        ])
+                        .collect()
+                    )
+                    quarterly_frames.append(q_peer)
+            except Exception:
+                continue
+
+    if len(quarterly_frames) < 2:
+        return None
+
+    return pl.concat(quarterly_frames, how="diagonal")
+
+
+def _normalize_quarterly_data(
+        pooled_q_df: pl.DataFrame,
+        available_cols: list[str]
+) -> tuple[pl.DataFrame, list[str], list[str]]:
+    """
+    Apply time-aware normalization (Z-scores per quarter).
+
+    Returns normalized dataframe, valid columns, and z-score column names.
+    """
+    # Filter only cols that exist in pooled data
+    valid_cols = [c for c in available_cols if c in pooled_q_df.columns]
+
+    z_exprs = []
+    MAD_FACTOR = 1.4826
+
+    for col in valid_cols:
+        median_expr = pl.col(col).median().over("_quarter_id")
+        mad_expr = (pl.col(col) - median_expr).abs().median().over("_quarter_id") * MAD_FACTOR
+
+        safe_scale = (
+            pl.when(mad_expr < 1e-6)
+            .then(pl.col(col).abs().mean().over("_quarter_id") * 0.01 + 1e-6)
+            .otherwise(mad_expr)
+        )
+
+        z_exprs.append(
+            ((pl.col(col) - median_expr) / safe_scale).alias(f"_z_{col}")
+        )
+
+    # Apply normalization and filter quarters with >= 3 tickers
+    normalized_df = (
+        pooled_q_df
+        .with_columns(pl.col("ticker").count().over("_quarter_id").alias("_peer_count"))
+        .filter(pl.col("_peer_count") >= 3)
+        .with_columns(z_exprs)
+    )
+
+    z_cols = [f"_z_{c}" for c in valid_cols]
+    return normalized_df, valid_cols, z_cols
+
+
+def _train_mcd_model(
+        normalized_df: pl.DataFrame,
+        z_cols: list[str],
+        valid_cols: list[str]
+) -> Optional[dict]:
+    """
+    Train robust covariance model on normalized sector data.
+
+    Uses MCD (Minimum Covariance Determinant) as primary estimator with
+    LedoitWolf shrinkage as fallback for numerical stability issues.
+
+    Returns dict with robust_loc, robust_prec, or None if training fails.
+    """
+    training_matrix = normalized_df.select(z_cols).drop_nulls().to_numpy()
+
+    # Safety: Need enough total points
+    if len(training_matrix) < len(valid_cols) * 5:
+        return None
+
+    robust_cov = None
+    robust_loc = None
+
+    # Try MCD first, catch determinant warnings and fall back to LedoitWolf
+    try:
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+
+            mcd = MinCovDet(random_state=42, support_fraction=0.9, assume_centered=False)
+            mcd.fit(training_matrix)
+
+            # Check if determinant warning was raised
+            determinant_warning = any(
+                "Determinant has increased" in str(w.message)
+                for w in caught_warnings
+            )
+
+            if not determinant_warning:
+                robust_cov = mcd.covariance_
+                robust_loc = mcd.location_
+
+    except Exception:
+        pass  # Will fall through to LedoitWolf
+
+    # Fallback to LedoitWolf if MCD failed or had numerical issues
+    if robust_cov is None:
+        try:
+            lw = LedoitWolf(assume_centered=False)
+            lw.fit(training_matrix)
+
+            robust_cov = lw.covariance_
+            robust_loc = lw.location_
+        except Exception:
+            return None
+
+    # Regularize diagonal for numerical stability (invertibility)
+    robust_cov.flat[::robust_cov.shape[0] + 1] += 1e-6
+    robust_prec = scipy.linalg.pinvh(robust_cov)
+
+    return {
+        "robust_loc": robust_loc,
+        "robust_prec": robust_prec
+    }
+
+
+def _compute_sector_model(
+        sector: str,
+        peer_symbols: list[str],
+        available_cols: list[str],
+        date_col: str,
+        confidence: float,
+        shared_data: dict
+) -> Optional[dict]:
+    """
+    Compute the complete sector model (quarterly data + MCD).
+
+    This is the expensive computation that gets cached per sector.
+    """
+    # Build quarterly data for all sector peers
+    pooled_q_df = _build_sector_quarterly_data(
+        peer_symbols, available_cols, date_col, shared_data
+    )
+
+    if pooled_q_df is None:
+        return None
+
+    # Normalize the data
+    normalized_df, valid_cols, z_cols = _normalize_quarterly_data(
+        pooled_q_df, available_cols
+    )
+
+    if normalized_df.is_empty():
+        return None
+
+    # Train MCD model
+    mcd_result = _train_mcd_model(normalized_df, z_cols, valid_cols)
+
+    if mcd_result is None:
+        return None
+
+    # Compute chi-squared threshold
+    chi2_thresh = chi2.ppf(1 - confidence, df=len(valid_cols))
+
+    return {
+        "normalized_df": normalized_df,
+        "valid_cols": valid_cols,
+        "z_cols": z_cols,
+        "robust_loc": mcd_result["robust_loc"],
+        "robust_prec": mcd_result["robust_prec"],
+        "chi2_thresh": chi2_thresh,
+        "date_col": date_col
+    }
 
 
 def mahalanobis_filter(
@@ -16,10 +309,17 @@ def mahalanobis_filter(
         shared_data: dict = None
 ) -> tuple[Union[pl.DataFrame, pl.LazyFrame], list[dict]]:
     """
-    Detect outliers using 'Sector Cloud' approach:
+    Detect outliers using 'Sector Cloud' approach with cached sector models.
+
+    This optimized version caches the MCD model per sector, so tickers in
+    the same sector share the computed model instead of recomputing it.
+
+    Algorithm:
     1. Collapses Daily -> Quarterly (Fixes Singularity)
     2. Normalizes per Quarter (Fixes Time Alignment)
-    3. Pools all history to learn Sector Geometry
+    3. Pools all history to learn Sector Geometry (CACHED per sector)
+    4. Scores target ticker against sector model
+    5. Imputes outlier quarters with forward-filled values
     """
     # --- 1. Setup & Validation ---
     is_lazy = isinstance(df, pl.LazyFrame)
@@ -56,138 +356,52 @@ def mahalanobis_filter(
         logs.append({"ticker": ticker, "error_type": "meta_error", "message": str(e)})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # --- 3. Collect & Collapse Data (Daily -> Quarterly) ---
-    # We process peers and target identically: Collapse to 1 row per quarter
-    quarterly_frames = []
+    # --- 3. Get or Compute Cached Sector Model ---
+    cache = shared_data.get("__sector_model_cache__")
 
-    # 3a. Process Target (from input df)
-    # We add a temp column _quarter_id (e.g., "2020-1")
-    target_q_lf = (
-        working_lf
-        .select([date_col] + available_cols)
-        .with_columns([
-            pl.lit(ticker_symbol).alias("ticker"),
-            (pl.col(date_col).dt.year().cast(pl.Utf8) + "-" +
-             pl.col(date_col).dt.quarter().cast(pl.Utf8)).alias("_quarter_id")
-        ])
-        .group_by(["ticker", "_quarter_id"])
-        .agg([
-            pl.col(date_col).last(),  # Keep last date of quarter for reference
-            *[pl.col(c).last() for c in available_cols]  # Keep last fundamental value
-        ])
-    )
-    quarterly_frames.append(target_q_lf.collect())
+    if cache is not None:
+        # Use cached sector model (optimized path)
+        def compute_fn():
+            return _compute_sector_model(
+                sector=target_sector,
+                peer_symbols=peer_symbols,
+                available_cols=available_cols,
+                date_col=date_col,
+                confidence=confidence,
+                shared_data=shared_data
+            )
 
-    # 3b. Process Peers (from shared_data)
-    for filename, payload in shared_data.items():
-        symbol = filename.replace(".csv", "")
-        if symbol in peer_symbols and symbol != ticker_symbol:
-            peer_lf = payload[0] if isinstance(payload, tuple) else payload
-            try:
-                peer_schema = set(peer_lf.collect_schema().names())
-                cols_curr = [c for c in [date_col] + available_cols if c in peer_schema]
+        sector_model = cache.get_or_compute(target_sector, compute_fn)
+    else:
+        # No cache available - compute directly (fallback for backward compatibility)
+        sector_model = _compute_sector_model(
+            sector=target_sector,
+            peer_symbols=peer_symbols,
+            available_cols=available_cols,
+            date_col=date_col,
+            confidence=confidence,
+            shared_data=shared_data
+        )
 
-                # Must have date + at least 1 feature
-                if len(cols_curr) > 1:
-                    q_peer = (
-                        peer_lf
-                        .select(cols_curr)
-                        .with_columns([
-                            pl.lit(symbol).alias("ticker"),
-                            (pl.col(date_col).dt.year().cast(pl.Utf8) + "-" +
-                             pl.col(date_col).dt.quarter().cast(pl.Utf8)).alias("_quarter_id")
-                        ])
-                        .group_by(["ticker", "_quarter_id"])
-                        .agg([
-                            pl.col(date_col).last(),
-                            *[pl.col(c).last() for c in cols_curr if c != date_col]
-                        ])
-                        .collect()
-                    )
-                    quarterly_frames.append(q_peer)
-            except Exception:
-                continue
-
-    if len(quarterly_frames) < 2:  # Target + at least 1 peer
-        logs.append({"ticker": ticker, "error_type": "no_peers", "message": "No peer data found"})
+    if sector_model is None:
+        logs.append({"ticker": ticker, "error_type": "sector_model_fail", "message": "Could not build sector model"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # Combine all quarterly snapshots
-    pooled_q_df = pl.concat(quarterly_frames, how="diagonal")
+    # --- 4. Extract Cached Model Components ---
+    normalized_df = sector_model["normalized_df"]
+    valid_cols = sector_model["valid_cols"]
+    z_cols = sector_model["z_cols"]
+    robust_loc = sector_model["robust_loc"]
+    robust_prec = sector_model["robust_prec"]
+    chi2_thresh = sector_model["chi2_thresh"]
 
-    # --- 4. Time-Aware Normalization (The "Ragged Edge" Fix) ---
-    # We calculate Z-scores grouped by QUARTER.
-    # This aligns 2010 data with 2020 data by removing the time-trend component.
+    # --- 5. Score Target Quarters ---
+    target_z_df = normalized_df.filter(pl.col("ticker") == ticker_symbol)
 
-    # Filter only cols that exist in pooled data
-    valid_cols = [c for c in available_cols if c in pooled_q_df.columns]
-
-    z_exprs = []
-    MAD_FACTOR = 1.4826
-
-    for col in valid_cols:
-        # Calculate Median per specific quarter (e.g., median of all peers in Q1 2020)
-        median_expr = pl.col(col).median().over("_quarter_id")
-
-        # Calculate MAD per specific quarter
-        mad_expr = (pl.col(col) - median_expr).abs().median().over("_quarter_id") * MAD_FACTOR
-
-        # Safe Scale: If MAD is 0 (all peers have same value), use fallback
-        # This handles cases where only 1 or 2 peers exist in a specific quarter
-        safe_scale = (
-            pl.when(mad_expr < 1e-6)
-            .then(pl.col(col).abs().mean().over("_quarter_id") * 0.01 + 1e-6)
-            .otherwise(mad_expr)
-        )
-
-        z_exprs.append(
-            ((pl.col(col) - median_expr) / safe_scale).alias(f"_z_{col}")
-        )
-
-    # Apply Normalization
-    # Filter: We only keep quarters where we have at least 3 tickers to form a valid "Cluster"
-    # Otherwise, Z-scores are meaningless (e.g. comparing ticker against itself)
-    normalized_df = (
-        pooled_q_df
-        .with_columns(pl.col("ticker").count().over("_quarter_id").alias("_peer_count"))
-        .filter(pl.col("_peer_count") >= 3)
-        .with_columns(z_exprs)
-    )
-
-    if normalized_df.filter(pl.col("ticker") == ticker_symbol).is_empty():
+    if target_z_df.is_empty():
         logs.append({"ticker": ticker, "error_type": "insufficient_history", "message": "Not enough overlapping peers"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # --- 5. Train "Sector Cloud" (MCD) ---
-    z_cols = [f"_z_{c}" for c in valid_cols]
-
-    # We train on EVERYONE (Peers + Target) across ALL TIME.
-    # This creates the "Sector Definition"
-    training_matrix = normalized_df.select(z_cols).drop_nulls().to_numpy()
-
-    # Safety: Need enough total points
-    if len(training_matrix) < len(valid_cols) * 5:
-        logs.append({"ticker": ticker, "error_type": "training_fail", "message": "N < 5p"})
-        return (working_lf.collect() if not is_lazy else working_lf, logs)
-
-    try:
-        # We can use high support because we have cleaned the data structure
-        mcd = MinCovDet(random_state=42, support_fraction=0.9, assume_centered=False)
-        mcd.fit(training_matrix)
-
-        robust_cov = mcd.covariance_
-        robust_loc = mcd.location_
-
-        # Regularize for safety (invertibility)
-        robust_cov.flat[::robust_cov.shape[0] + 1] += 1e-6
-        robust_prec = scipy.linalg.pinvh(robust_cov)
-
-    except Exception as e:
-        logs.append({"ticker": ticker, "error_type": "mcd_error", "message": str(e)})
-        return (working_lf.collect() if not is_lazy else working_lf, logs)
-
-    # --- 6. Score Target Quarters ---
-    target_z_df = normalized_df.filter(pl.col("ticker") == ticker_symbol)
     target_mat = target_z_df.select(z_cols).to_numpy()
 
     # Calculate Distances
@@ -199,10 +413,7 @@ def mahalanobis_filter(
         # (x-u)P(x-u)'
         distances[mask] = np.sum((diff @ robust_prec) * diff, axis=1)
 
-    # --- 7. Detect & Broadcast ---
-    chi2_thresh = chi2.ppf(1 - confidence, df=len(valid_cols))
-
-    # Identify bad quarters
+    # --- 6. Detect Outliers ---
     bad_indices = np.where(distances > chi2_thresh)[0]
     bad_quarters = set()
 
@@ -216,22 +427,16 @@ def mahalanobis_filter(
             if len(logs) < MAX_CORRECTIONS_LOG:
                 logs.append({
                     "ticker": ticker,
-                    "date": dates[idx],  # Representative date
+                    "date": dates[idx],
                     "quarter": q,
                     "error_type": "mahalanobis_outlier",
                     "dist": float(distances[idx]),
                     "threshold": chi2_thresh
                 })
 
-    # --- 8. Imputation (Broadcast back to Daily) ---
+    # --- 7. Imputation (Broadcast back to Daily) ---
     if not bad_quarters:
         return (working_lf.collect() if not is_lazy else working_lf, logs)
-
-    # Strategy:
-    # 1. Take the Clean Target Quarterly Data
-    # 2. Nullify values in Bad Quarters
-    # 3. Forward Fill (fill bad quarter with previous quarter's value)
-    # 4. Join back to Daily data on Quarter_ID
 
     # Create 'Corrected' Quarterly Map
     corrected_map = (
@@ -252,7 +457,6 @@ def mahalanobis_filter(
     )
 
     # Prepare Daily Data for Join
-    # Add quarter_id to daily data
     daily_w_quarter = (
         working_lf
         .with_columns(
@@ -262,16 +466,14 @@ def mahalanobis_filter(
     )
 
     # Join and Overwrite
-    # We join the corrected quarterly values onto the daily rows
     final_df = (
         daily_w_quarter
         .join(corrected_map, on="_quarter_id", how="left")
         .with_columns([
-            # If we have a corrected value, use it. Else keep original.
             pl.coalesce([pl.col(f"{c}_corrected"), pl.col(c)]).alias(c)
             for c in valid_cols
         ])
-        .select(working_lf.collect_schema().names())  # Restore original schema
+        .select(working_lf.collect_schema().names())
     )
 
     return (final_df.collect() if not is_lazy else final_df, logs)

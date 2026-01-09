@@ -19,6 +19,7 @@ from src.modules.errors.statistical_filter import (
     mad_filter,
     rolling_z_score
 )
+from src.modules.errors.statistical_filter.mahalanobis_filter import SectorModelCache
 from src.features import parallel_process_tickers, consolidate_audit_logs
 from src.dashboard import run_dashboard
 
@@ -338,13 +339,24 @@ if __name__ == "__main__":
             batch_size=batch_size
         )
 
+        # Create sector model cache for Mahalanobis filter optimization
+        # This cache stores computed MCD models per sector, avoiding redundant
+        # computation when multiple tickers from the same sector are processed.
+        sector_cache = SectorModelCache()
+
+        # Inject cache into shared_data so all parallel workers can access it
+        shared_data_with_cache = dict(dataframe_dict_clean_rolling)
+        shared_data_with_cache["__sector_model_cache__"] = sector_cache
+
         dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_rolling,
             columns=mahalanobis_cols,
             function=mahalanobis_filter,
             batch_size=batch_size,
-            shared_data=dataframe_dict_clean_rolling  # Pass all ticker data for cross-sectional peer analysis
+            shared_data=shared_data_with_cache  # Pass all ticker data + cache for cross-sectional peer analysis
         )
+
+        logger.info(f"Mahalanobis filter: {len(sector_cache)} sector models cached")
 
         dataframe_dict_clean_mad, mad_logs = parallel_process_tickers(
             data_dict=dataframe_dict_clean_mahalanobis,
