@@ -332,12 +332,12 @@ if __name__ == "__main__":
             "c_log_returns_dividend_and_split_adjusted"
         ]
 
-        dataframe_dict_clean_rolling, rolling_z_logs = parallel_process_tickers(
-            data_dict=dataframe_dict,
-            columns=rolling_z_cols,
-            function=rolling_z_score,
-            batch_size=batch_size
-        )
+        # dataframe_dict_clean_rolling, rolling_z_logs = parallel_process_tickers(
+        #     data_dict=dataframe_dict,
+        #     columns=rolling_z_cols,
+        #     function=rolling_z_score,
+        #     batch_size=batch_size
+        # )
 
         # Create sector model cache for Mahalanobis filter optimization
         # This cache stores computed MCD models per sector, avoiding redundant
@@ -345,11 +345,19 @@ if __name__ == "__main__":
         sector_cache = SectorModelCache()
 
         # Inject cache into shared_data so all parallel workers can access it
-        shared_data_with_cache = dict(dataframe_dict_clean_rolling)
+        shared_data_with_cache = dict(dataframe_dict)
         shared_data_with_cache["__sector_model_cache__"] = sector_cache
 
+        # dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
+        #     data_dict=dataframe_dict_clean_rolling,
+        #     columns=mahalanobis_cols,
+        #     function=mahalanobis_filter,
+        #     batch_size=batch_size,
+        #     shared_data=shared_data_with_cache  # Pass all ticker data + cache for cross-sectional peer analysis
+        # )
+
         dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
-            data_dict=dataframe_dict_clean_rolling,
+            data_dict=dataframe_dict,
             columns=mahalanobis_cols,
             function=mahalanobis_filter,
             batch_size=batch_size,
@@ -386,9 +394,9 @@ if __name__ == "__main__":
         return dataframe_dict_clean_garch, logs
 
 
-    clean_lfs, logs = run_full_sanity_check()
+    # clean_lfs, logs = run_full_sanity_check()
 
-    # clean_lfs, logs = run_full_statistical_filter()
+    clean_lfs, logs = run_full_statistical_filter()
 
 
     print("Data cleaning complete. Launching dashboard...")
