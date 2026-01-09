@@ -22,7 +22,7 @@ from src.modules.errors.statistical_filter import (
     MetadataCache
 )
 from src.features import parallel_process_tickers, consolidate_audit_logs
-from src.dashboard import run_dashboard
+from src.dashboard import launch_dashboard
 from src.output_handlers import save_corrected_data
 
 current_dir = Path.cwd()
@@ -459,14 +459,3 @@ def run_full_pipeline(data: dict, save_data: bool, out_format: str, output_logs_
     logger.info(f"Successfully saved {len(saved_files)} corrected data files to {output_data_directory}")
 
     return clean_lfs, sanity_logs, stats_logs
-
-
-
-# Launch the dashboard with file paths for on-demand loading (memory efficient)
-# run_dashboard(
-#     original_file_paths=original_file_paths,
-#     cleaned_dataframes=clean_lfs,
-#     logs=logs,
-#     debug=True,
-#     port=8050
-# )

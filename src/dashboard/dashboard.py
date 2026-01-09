@@ -2146,8 +2146,6 @@ def launch_dashboard(
         # Combine logs
         logs = {**sanity_logs, **stats_logs}
 
-        print(f"Pipeline complete: {len(cleaned_dataframes)} tickers processed")
-
     # Launch the dashboard
     run_dashboard(
         original_file_paths=original_file_paths,
@@ -2180,14 +2178,6 @@ def run_dashboard(
         port: Port number for the server
     """
     app = create_app(original_file_paths, cleaned_dataframes, logs)
-
-    print(f"\n{'='*60}")
-    print("Data Corrector Dashboard")
-    print(f"{'='*60}")
-    print(f"Starting server at http://127.0.0.1:{port}")
-    print(f"Loaded {len(original_file_paths)} ticker file paths (on-demand loading)")
-    print(f"Debug mode: {debug}")
-    print(f"{'='*60}\n")
 
     # Disable reloader to prevent re-running the entire data cleaning pipeline
     # The reloader spawns a child process that re-executes the script from the start
