@@ -45,7 +45,7 @@ def rolling_z_score(
         return (working_lf if is_lazy else working_lf.collect(), logs)
 
     # 2. Configuration & Dynamic Threshold
-    window_size = 63
+    window_size = 21
     min_periods = 10
 
     try:
