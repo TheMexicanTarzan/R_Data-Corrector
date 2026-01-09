@@ -55,6 +55,9 @@ def mad_filter(
     # Consistency constant for MAD (makes MAD consistent with std for normal data)
     consistency_constant = 0.6745
 
+    # Collect ALL outliers across all columns, then sort by severity
+    all_outlier_logs = []
+
     # 3. Vectorized Loop per Column
     for col in available_cols:
         # -- Step A: Calculate Stats in Polars (Fast) --
@@ -109,8 +112,6 @@ def mad_filter(
             idx_in_valid = numpy.clip(idx_in_valid, 0, len(valid_indices) - 1)
             corrected_values_array = valid_values[idx_in_valid]
 
-        col_corrections_logged = 0
-
         # -- Step D: Apply & Log --
         for i, idx in enumerate(outlier_indices):
             original_val = float(col_values[idx])
@@ -124,27 +125,33 @@ def mad_filter(
 
             col_values[idx] = new_val
 
-            if col_corrections_logged < MAX_CORRECTIONS_LOG:
-                logs.append({
-                    "ticker": ticker,
-                    "date": dates[idx],
-                    "column": col,
-                    "error_type": "mad_outlier",
-                    "original_value": original_val,
-                    "corrected_value": new_val,
-                    "modified_z_score": z_score_val,
-                    "median": float(median_val),
-                    "mad": float(mad_val),
-                    "threshold": threshold,
-                    "confidence_alpha": confidence,
-                    "method": method_used
-                })
-                col_corrections_logged += 1
+            # Collect ALL outliers with severity for later sorting
+            all_outlier_logs.append({
+                "ticker": ticker,
+                "date": dates[idx],
+                "column": col,
+                "error_type": "mad_outlier",
+                "original_value": original_val,
+                "corrected_value": new_val,
+                "modified_z_score": z_score_val,
+                "median": float(median_val),
+                "mad": float(mad_val),
+                "threshold": threshold,
+                "confidence_alpha": confidence,
+                "method": method_used,
+                "_severity": abs(z_score_val)  # For sorting by most anomalous
+            })
 
         # -- Step E: Update DataFrame --
         working_df = working_df.with_columns(
             polars.Series(name=col, values=col_values)
         )
+
+    # Sort by severity (highest |z-score| first) and keep top K most anomalous
+    all_outlier_logs.sort(key=lambda x: x["_severity"], reverse=True)
+    for log_entry in all_outlier_logs[:MAX_CORRECTIONS_LOG]:
+        del log_entry["_severity"]  # Remove internal sorting field
+        logs.append(log_entry)
 
     # 4. Join Back to LazyFrame
     corrected_cols_df = working_df.select(available_cols)

@@ -497,19 +497,29 @@ def mahalanobis_filter(
     bad_indices = numpy.where(distances > chi2_thresh)[0]
     bad_quarters = set()
 
+    # Collect ALL outliers first, then sort by severity (distance) to return top K
+    all_outlier_logs = []
+
     if len(bad_indices) > 0:
         for idx in bad_indices:
             q = q_ids[idx]
             bad_quarters.add(q)
-            if len(logs) < MAX_CORRECTIONS_LOG and dates:
-                logs.append({
+            if dates:
+                all_outlier_logs.append({
                     "ticker": ticker,
                     "date": dates[idx] if idx < len(dates) else None,
                     "quarter": q,
                     "error_type": "mahalanobis_outlier",
                     "dist": float(distances[idx]),
-                    "threshold": chi2_thresh
+                    "threshold": chi2_thresh,
+                    "_severity": float(distances[idx])  # For sorting
                 })
+
+        # Sort by severity (highest distance first) and keep top K
+        all_outlier_logs.sort(key=lambda x: x["_severity"], reverse=True)
+        for log_entry in all_outlier_logs[:MAX_CORRECTIONS_LOG]:
+            del log_entry["_severity"]  # Remove internal field
+            logs.append(log_entry)
 
     if not bad_quarters:
         return (working_lf.collect() if not is_lazy else working_lf, logs)

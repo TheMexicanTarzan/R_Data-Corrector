@@ -62,6 +62,9 @@ def rolling_z_score(
 
     dates = working_df[date_col].to_list()
 
+    # Collect ALL outliers across all columns, then sort by severity
+    all_outlier_logs = []
+
     for col in available_cols:
         # 3. Vectorized Rolling Stats Calculation
         # shift(1) ensures we don't include current time t in the window
@@ -113,8 +116,6 @@ def rolling_z_score(
         else:
             continue
 
-        col_corrections_logged = 0
-
         # Apply corrections and Log
         for i, idx in enumerate(outlier_indices):
             original_val = float(col_values[idx])
@@ -126,24 +127,23 @@ def rolling_z_score(
                 new_val = float(clean_values_for_fit[nearest_idx])
                 method_used = "last_valid_value_fallback"
 
-            # Log
-            if col_corrections_logged < MAX_CORRECTIONS_LOG:
-                logs.append({
-                    "ticker": ticker,
-                    "date": dates[idx],
-                    "column": col,
-                    "error_type": "rolling_z_outlier",
-                    "original_value": original_val,
-                    "corrected_value": new_val,
-                    "z_score": float(z_scores[idx]),
-                    "rolling_mean": float(rolling_mean[idx]),
-                    "rolling_std": float(rolling_std[idx]),
-                    "threshold": threshold,
-                    "confidence_alpha": confidence,
-                    "window_size": window_size,
-                    "method": method_used
-                })
-                col_corrections_logged += 1
+            # Collect ALL outliers with severity for later sorting
+            all_outlier_logs.append({
+                "ticker": ticker,
+                "date": dates[idx],
+                "column": col,
+                "error_type": "rolling_z_outlier",
+                "original_value": original_val,
+                "corrected_value": new_val,
+                "z_score": float(z_scores[idx]),
+                "rolling_mean": float(rolling_mean[idx]),
+                "rolling_std": float(rolling_std[idx]),
+                "threshold": threshold,
+                "confidence_alpha": confidence,
+                "window_size": window_size,
+                "method": method_used,
+                "_severity": abs(float(z_scores[idx]))  # For sorting by most anomalous
+            })
 
             # Update the main array
             col_values[idx] = new_val
@@ -152,6 +152,12 @@ def rolling_z_score(
         working_df = working_df.with_columns(
             polars.Series(name=col, values=col_values)
         )
+
+    # Sort by severity (highest |z-score| first) and keep top K most anomalous
+    all_outlier_logs.sort(key=lambda x: x["_severity"], reverse=True)
+    for log_entry in all_outlier_logs[:MAX_CORRECTIONS_LOG]:
+        del log_entry["_severity"]  # Remove internal sorting field
+        logs.append(log_entry)
 
     # 5. Join back to original structure
     corrected_cols_df = working_df.select(available_cols)
