@@ -29,7 +29,7 @@ data_directory = current_dir / ".." / "Input" / "Data"
 metadata_path = current_dir / ".." / "Input" / "Universe_Information" / "Universe_Information.csv"
 output_logs_directory = current_dir / ".." / "Output"
 batch_size = 512
-max_files = 20000
+max_files = 512
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -411,9 +411,9 @@ if __name__ == "__main__":
         return dataframe_dict_clean_garch, logs
 
 
-    # clean_lfs, logs = run_full_sanity_check()
+    clean_lfs, logs = run_full_sanity_check()
 
-    clean_lfs, logs = run_full_statistical_filter()
+    # clean_lfs, logs = run_full_statistical_filter()
 
 
     print("Data cleaning complete. Launching dashboard...")

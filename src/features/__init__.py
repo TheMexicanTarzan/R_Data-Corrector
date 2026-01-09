@@ -1,1 +1,2 @@
-from .lazy_parallelization import parallel_process_tickers, consolidate_audit_logs
+from .lazy_parallelization import parallel_process_tickers
+from .log_consolidation import consolidate_audit_logs
