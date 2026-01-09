@@ -333,12 +333,12 @@ if __name__ == "__main__":
             "c_log_returns_dividend_and_split_adjusted"
         ]
 
-        # dataframe_dict_clean_rolling, rolling_z_logs = parallel_process_tickers(
-        #     data_dict=dataframe_dict,
-        #     columns=rolling_z_cols,
-        #     function=rolling_z_score,
-        #     batch_size=batch_size
-        # )
+        dataframe_dict_clean_rolling, rolling_z_logs = parallel_process_tickers(
+            data_dict=dataframe_dict,
+            columns=rolling_z_cols,
+            function=rolling_z_score,
+            batch_size=batch_size
+        )
 
         # Create sector model cache for Mahalanobis filter optimization
         # This cache stores computed MCD models per sector, avoiding redundant

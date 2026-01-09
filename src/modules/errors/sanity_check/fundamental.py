@@ -2,6 +2,7 @@ import polars
 from typing import Union, Literal
 import logging
 
+MAX_LOGS = 10
 
 def sort_dates(
         df: Union[polars.DataFrame, polars.LazyFrame],
@@ -211,7 +212,7 @@ def fill_negatives_fundamentals(
     audit_log = {}
 
     # MEMORY FIX: Limit audit log entries per column
-    MAX_AUDIT_PER_COLUMN = 50
+    MAX_AUDIT_PER_COLUMN = MAX_LOGS
 
     # 1. Audit Step - requires collecting problem rows (limited sample)
     for col in columns:
@@ -280,7 +281,7 @@ def zero_wipeout(
     target_cols = columns
 
     # MEMORY FIX: Limit audit log entries
-    MAX_AUDIT_ENTRIES = 50
+    MAX_AUDIT_ENTRIES = MAX_LOGS
 
     # Build condition: ANY target column is 0 AND volume > 0
     # Create condition for each column, then combine with OR
@@ -387,7 +388,7 @@ def mkt_cap_scale_error(
         combined_condition = combined_condition | cond
 
     # MEMORY FIX: Limit audit log entries
-    MAX_AUDIT_ENTRIES = 50
+    MAX_AUDIT_ENTRIES = MAX_LOGS
     select_cols = [date_col] + available_target_cols
 
     audit_log = []
