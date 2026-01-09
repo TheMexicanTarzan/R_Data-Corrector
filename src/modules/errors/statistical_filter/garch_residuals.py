@@ -12,7 +12,7 @@ import math
 # 1. Numba-Compiled Core with Student's t-Distribution
 # ---------------------------------------------------------
 @jit(nopython=True, cache=True)
-def garch_recursion(params, returns, sigma2_0):
+def garch_t_recursion(params, returns, sigma2_0):
     """
     Computes GARCH(1,1) Log-Likelihood assuming Student's t-distribution.
     params: [omega, alpha, beta, nu]
