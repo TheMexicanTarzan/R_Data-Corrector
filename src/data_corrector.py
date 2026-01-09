@@ -23,6 +23,7 @@ from src.modules.errors.statistical_filter import (
 )
 from src.features import parallel_process_tickers, consolidate_audit_logs
 from src.dashboard import run_dashboard
+from src.output_handlers import save_corrected_data
 
 current_dir = Path.cwd()
 data_directory = current_dir / ".." / "Input" / "Data"
@@ -416,6 +417,18 @@ if __name__ == "__main__":
 
     clean_lfs, logs = run_full_statistical_filter(clean_lfs, save_data = save_data)
 
+    # Save corrected data if requested
+    if save_data:
+        logger.info("Saving corrected data to CSV files...")
+        output_data_directory = output_logs_directory / "CorrectedData"
+        saved_files = save_corrected_data(
+            clean_data_dict=clean_lfs,
+            output_directory=output_data_directory,
+            file_format="csv",
+            create_directory=True,
+            overwrite=True
+        )
+        logger.info(f"Successfully saved {len(saved_files)} corrected data files to {output_data_directory}")
 
     print("Data cleaning complete. Launching dashboard...")
 
