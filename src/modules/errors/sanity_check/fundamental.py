@@ -4,6 +4,42 @@ import logging
 
 MAX_LOGS = 10
 
+
+def _add_quarter_column(
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        date_col: str = "m_date"
+) -> Union[polars.DataFrame, polars.LazyFrame]:
+    """
+    Add a quarter identifier column to the dataframe based on the date column.
+
+    Args:
+        df: Input DataFrame or LazyFrame
+        date_col: Name of the date column to extract quarter from
+
+    Returns:
+        DataFrame/LazyFrame with added '_quarter' column in format 'YYYY-QN'
+    """
+    # Get schema to check column type
+    is_lazy = isinstance(df, polars.LazyFrame)
+    schema = df.collect_schema() if is_lazy else df.schema
+    col_dtype = schema.get(date_col)
+
+    # Parse date if it's a string
+    if col_dtype == polars.String or col_dtype == polars.Utf8:
+        date_expr = polars.col(date_col).str.to_date("%m/%d/%Y", strict=False)
+    else:
+        date_expr = polars.col(date_col).cast(polars.Date, strict=False)
+
+    # Create quarter identifier: YYYY-Q1, YYYY-Q2, etc.
+    quarter_expr = (
+        date_expr.dt.year().cast(polars.Utf8) +
+        "-Q" +
+        date_expr.dt.quarter().cast(polars.Utf8)
+    ).alias("_quarter")
+
+    return df.with_columns(quarter_expr)
+
+
 def sort_dates(
         df: Union[polars.DataFrame, polars.LazyFrame],
         metadata: polars.LazyFrame,
@@ -186,6 +222,7 @@ def fill_negatives_fundamentals(
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict[str, list[dict]]]:
     """
     Replaces negative values in specified columns with the last non-negative value.
+    Processes data quarterly - evaluates once per quarter and applies corrections to all rows in that quarter.
     Works with both DataFrame (eager) and LazyFrame (lazy) execution.
 
     Args:
@@ -200,13 +237,15 @@ def fill_negatives_fundamentals(
         - Audit Dictionary format:
         {
             'column_name': [
-                {'ticker': 'AAPL', 'date': '...', 'value': -5},
+                {'ticker': 'AAPL', 'quarter': 'YYYY-QN', 'date_range_start': '...',
+                 'date_range_end': '...', 'value': -5, 'count': N},
                 ...
             ]
         }
 
     Note:
         Assumes columns are already correctly typed as Float64 via schema enforcement.
+        Fundamental data is quarterly, so each quarter is evaluated once.
     """
     is_lazy = isinstance(df, polars.LazyFrame)
     audit_log = {}
@@ -214,29 +253,42 @@ def fill_negatives_fundamentals(
     # MEMORY FIX: Limit audit log entries per column
     MAX_AUDIT_PER_COLUMN = MAX_LOGS
 
-    # 1. Audit Step - requires collecting problem rows (limited sample)
+    # Add quarter column for grouping
+    df_with_quarter = _add_quarter_column(df, date_col)
+
+    # 1. Audit Step - group by quarter and log once per quarter
     for col in columns:
-        # Build query for problem rows with limit
+        # Build query for problem quarters (group by quarter, take first negative value per quarter)
         problem_query = (
-            df.lazy()
+            df_with_quarter.lazy()
             .filter(polars.col(col) < 0)
-            .select([date_col, col])
+            .group_by("_quarter")
+            .agg([
+                polars.col(date_col).min().alias("date_range_start"),
+                polars.col(date_col).max().alias("date_range_end"),
+                polars.col(col).first().alias("value"),  # Representative value from quarter
+                polars.col(col).count().alias("count")  # Number of negative entries in quarter
+            ])
+            .sort("date_range_start")
             .limit(MAX_AUDIT_PER_COLUMN)
         )
 
-        # Collect only the limited problem rows
-        problem_rows = problem_query.collect()
+        # Collect only the limited problem quarters
+        problem_quarters = problem_query.collect()
 
-        # Check if there are any problem rows
-        if len(problem_rows) > 0:
+        # Check if there are any problem quarters
+        if len(problem_quarters) > 0:
             # Convert to dicts and inject the ticker string into every entry
-            entries = problem_rows.to_dicts()
+            entries = problem_quarters.to_dicts()
             for entry in entries:
                 entry['ticker'] = ticker
+                # Rename _quarter to quarter for cleaner output
+                entry['quarter'] = entry.pop('_quarter')
             audit_log[col] = entries
 
     # 2. Cleaning Step - works lazily or eagerly
-    cleaned_df = df.with_columns(
+    # Apply forward fill within each quarter group
+    cleaned_df = df_with_quarter.with_columns(
         (
             polars.when(polars.col(col) >= 0)
             .then(polars.col(col))
@@ -245,7 +297,7 @@ def fill_negatives_fundamentals(
             .alias(col)
         )
         for col in columns
-    )
+    ).drop("_quarter")
 
     return cleaned_df, audit_log
 
@@ -261,6 +313,7 @@ def zero_wipeout(
     """
     Identifies rows where share columns are 0 AND 'm_volume' > 0.
     These 0 values are replaced via forward fill.
+    Processes data quarterly - evaluates once per quarter and applies corrections to all rows in that quarter.
     Works with both DataFrame (eager) and LazyFrame (lazy) execution.
 
     Args:
@@ -271,9 +324,13 @@ def zero_wipeout(
 
     Returns:
         tuple: (Cleaned DataFrame/LazyFrame, Audit List)
+        - Audit List format: [{'ticker': 'AAPL', 'quarter': 'YYYY-QN',
+                               'date_range_start': '...', 'date_range_end': '...',
+                               'affected_columns': [...], 'count': N}, ...]
 
     Note:
         Assumes columns are already correctly typed as Float64 via schema enforcement.
+        Fundamental data is quarterly, so each quarter is evaluated once.
     """
     import polars as pl
 
@@ -282,6 +339,9 @@ def zero_wipeout(
 
     # MEMORY FIX: Limit audit log entries
     MAX_AUDIT_ENTRIES = MAX_LOGS
+
+    # Add quarter column for grouping
+    df_with_quarter = _add_quarter_column(df, date_col)
 
     # Build condition: ANY target column is 0 AND volume > 0
     # Create condition for each column, then combine with OR
@@ -295,22 +355,40 @@ def zero_wipeout(
 
     final_condition = combined_condition & (pl.col("m_volume") > 0)
 
-    # 1. Audit Step - collect limited problem rows
+    # 1. Audit Step - group by quarter and log once per quarter
+    # For each column, identify which quarters have the issue
     problem_query = (
-        df.lazy()
+        df_with_quarter.lazy()
         .filter(final_condition)
-        .select([date_col] + target_cols + ["m_volume"])
+        .group_by("_quarter")
+        .agg([
+            pl.col(date_col).min().alias("date_range_start"),
+            pl.col(date_col).max().alias("date_range_end"),
+            pl.col("m_volume").first().alias("volume"),  # Representative volume
+            pl.len().alias("count")  # Number of affected rows in quarter
+        ] + [
+            # Track which columns had zeros
+            pl.col(col).min().alias(f"{col}_min") for col in target_cols
+        ])
+        .sort("date_range_start")
         .limit(MAX_AUDIT_ENTRIES)
     )
 
-    # Collect only the limited problem rows
-    problem_rows = problem_query.collect()
+    # Collect only the limited problem quarters
+    problem_quarters = problem_query.collect()
 
     audit_log = []
-    if len(problem_rows) > 0:
-        entries = problem_rows.to_dicts()
+    if len(problem_quarters) > 0:
+        entries = problem_quarters.to_dicts()
         for entry in entries:
             entry['ticker'] = ticker
+            entry['quarter'] = entry.pop('_quarter')
+            # Identify which columns had zeros
+            affected_cols = [col for col in target_cols if entry.get(f"{col}_min") == 0]
+            entry['affected_columns'] = affected_cols
+            # Clean up temporary min columns
+            for col in target_cols:
+                entry.pop(f"{col}_min", None)
         audit_log = entries
 
     # 2. Cleaning Step - process each column separately
@@ -319,7 +397,7 @@ def zero_wipeout(
         # Condition for this specific column
         col_condition = (pl.col(col) == 0) & (pl.col("m_volume") > 0)
 
-        df = df.with_columns(
+        df_with_quarter = df_with_quarter.with_columns(
             pl.when(col_condition)
             .then(None)  # Replace problematic 0s with null
             .otherwise(pl.col(col))  # Keep everything else
@@ -327,7 +405,10 @@ def zero_wipeout(
             .alias(col)
         )
 
-    return df, audit_log
+    # Remove quarter column before returning
+    result_df = df_with_quarter.drop("_quarter")
+
+    return result_df, audit_log
 
 
 def mkt_cap_scale_error(
@@ -342,8 +423,9 @@ def mkt_cap_scale_error(
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Identifies and corrects rows where share columns jump by 10x or more
-    compared to the previous day. If both market cap and shares outstanding
-    jump together, forward fills the entire span of the shares outstanding error.
+    compared to the previous quarter. If both market cap and shares outstanding
+    jump together, forward fills the entire quarter.
+    Processes data quarterly - evaluates once per quarter and applies corrections to all rows in that quarter.
 
     Args:
         df: Input polars DataFrame or LazyFrame.
@@ -355,9 +437,13 @@ def mkt_cap_scale_error(
 
     Returns:
         tuple: (Cleaned DataFrame/LazyFrame, Audit List)
+        - Audit List format: [{'ticker': 'AAPL', 'quarter': 'YYYY-QN',
+                               'date_range_start': '...', 'date_range_end': '...',
+                               'error_type': '...', 'affected_columns': [...], 'count': N}, ...]
 
     Note:
         Assumes columns are already correctly typed as Float64 via schema enforcement.
+        Fundamental data is quarterly, so each quarter is evaluated once.
     """
     is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df.lazy()
@@ -370,7 +456,10 @@ def mkt_cap_scale_error(
     has_market_cap = market_cap_col in schema_cols
     has_shares = shares_outstanding_col in schema_cols
 
-    # Build combined condition for audit
+    # Add quarter column for grouping
+    working_lf = _add_quarter_column(working_lf, date_col)
+
+    # Build combined condition for audit - check for 10x jumps from previous row
     conditions = []
     available_target_cols = []
     for col in target_cols:
@@ -389,25 +478,41 @@ def mkt_cap_scale_error(
 
     # MEMORY FIX: Limit audit log entries
     MAX_AUDIT_ENTRIES = MAX_LOGS
-    select_cols = [date_col] + available_target_cols
 
     audit_log = []
     try:
-        problem_rows = (
+        # Group by quarter and identify affected quarters
+        problem_query = (
             working_lf
             .filter(combined_condition)
-            .select(select_cols)
+            .group_by("_quarter")
+            .agg([
+                polars.col(date_col).min().alias("date_range_start"),
+                polars.col(date_col).max().alias("date_range_end"),
+                polars.len().alias("count")
+            ] + [
+                polars.col(col).first().alias(f"{col}_value") for col in available_target_cols
+            ])
+            .sort("date_range_start")
             .limit(MAX_AUDIT_ENTRIES)
-            .collect()
         )
 
-        if problem_rows.height > 0:
-            entries = problem_rows.to_dicts()
+        problem_quarters = problem_query.collect()
+
+        if problem_quarters.height > 0:
+            entries = problem_quarters.to_dicts()
             for entry in entries:
                 entry['ticker'] = ticker
+                entry['quarter'] = entry.pop('_quarter')
                 entry['error_type'] = "scale_10x_jump"
+                # Identify which columns had jumps
+                affected_cols = [col for col in available_target_cols if f"{col}_value" in entry]
+                entry['affected_columns'] = affected_cols
+                # Clean up temporary value columns
+                for col in available_target_cols:
+                    entry.pop(f"{col}_value", None)
             audit_log = entries
-            logging.info(f"Found scale errors (10x jump) for ticker {ticker} (sampled {len(audit_log)})")
+            logging.info(f"Found scale errors (10x jump) for ticker {ticker} in {len(audit_log)} quarters")
     except Exception:
         pass  # Continue without audit if it fails
 
@@ -449,6 +554,9 @@ def mkt_cap_scale_error(
                 .alias(col)
             )
 
+    # Remove quarter column before returning
+    working_lf = working_lf.drop("_quarter")
+
     if is_lazy:
         return working_lf, audit_log
     else:
@@ -466,6 +574,7 @@ def validate_financial_equivalencies(
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], dict]:
     """
     Validate and clean financial statement data by enforcing accounting identities.
+    Processes data quarterly - evaluates once per quarter and logs with date ranges.
 
     Performs two types of validations:
     1. Hard Filters: Structural equations that are corrected via proportional scaling
@@ -487,16 +596,20 @@ def validate_financial_equivalencies(
         tuple containing:
             - Cleaned DataFrame/LazyFrame (same type as input)
             - Dictionary with keys 'hard_filter_errors' and 'soft_filter_warnings',
-              each containing lists of error dictionaries
+              each containing lists of error dictionaries with quarterly aggregation
 
     Note:
         Hard filter corrections use proportional scaling:
         - Factor = Total / (Current + Noncurrent)
         - NewComponent = OldComponent * Factor
         - Edge case: If components sum to 0 but total != 0, value goes to noncurrent
+        Fundamental data is quarterly, so each quarter is evaluated once.
     """
     is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
+
+    # Add quarter column for grouping
+    working_lf = _add_quarter_column(working_lf, date_col)
 
     # Get schema to check column existence
     schema_cols = set(working_lf.collect_schema().names())
@@ -634,40 +747,59 @@ def validate_financial_equivalencies(
             "noncurrent_col": noncurrent_col
         })
 
-    # Log hard filter violations before correction
+    # Log hard filter violations before correction - group by quarter
     if hard_violation_exprs:
         any_hard_violation = polars.any_horizontal(
             *[polars.col(info["flag"]) for info in hard_violation_info]
         )
 
-        hard_error_rows_df = (
+        # Group by quarter and aggregate violations
+        hard_error_query = (
             working_lf
-            .select(list(columns_for_hard_logging))
+            .select(list(columns_for_hard_logging) + ["_quarter"])
             .with_columns(hard_violation_exprs)
             .filter(any_hard_violation)
-            .collect()
         )
 
-        if not hard_error_rows_df.is_empty():
-            error_rows = hard_error_rows_df.to_dicts()
+        # For each violation type, group by quarter
+        for info in hard_violation_info:
+            total_col = info["total_col"]
+            current_col = info["current_col"]
+            noncurrent_col = info["noncurrent_col"]
+            flag = info["flag"]
 
-            for row in error_rows:
-                for info in hard_violation_info:
-                    if not row.get(info["flag"]):
-                        continue
+            quarter_errors = (
+                hard_error_query
+                .filter(polars.col(flag))
+                .group_by("_quarter")
+                .agg([
+                    polars.col(date_col).min().alias("date_range_start"),
+                    polars.col(date_col).max().alias("date_range_end"),
+                    polars.col(total_col).first().alias("total"),
+                    polars.col(current_col).first().alias("current"),
+                    polars.col(noncurrent_col).first().alias("noncurrent"),
+                    polars.len().alias("count")
+                ])
+                .sort("date_range_start")
+                .limit(MAX_LOGS)
+                .collect()
+            )
 
-                    total_col = info["total_col"]
-                    current_col = info["current_col"]
-                    noncurrent_col = info["noncurrent_col"]
+            if quarter_errors.height > 0:
+                error_rows = quarter_errors.to_dicts()
 
-                    total_val = row.get(total_col)
-                    current_val = row.get(current_col)
-                    noncurrent_val = row.get(noncurrent_col)
+                for row in error_rows:
+                    total_val = row.get("total")
+                    current_val = row.get("current")
+                    noncurrent_val = row.get("noncurrent")
                     component_sum_val = current_val + noncurrent_val
 
                     error_entry = {
                         "ticker": ticker,
-                        "date": row.get(date_col),
+                        "quarter": row.get("_quarter"),
+                        "date_range_start": row.get("date_range_start"),
+                        "date_range_end": row.get("date_range_end"),
+                        "count": row.get("count"),
                         "error_type": info["error_type"],
                         "total": total_val,
                         "current": current_val,
@@ -785,33 +917,84 @@ def validate_financial_equivalencies(
             *[polars.col(info["flag"]) for info in soft_violation_info]
         )
 
-        soft_error_rows_df = (
+        # Group by quarter and aggregate violations
+        soft_error_query = (
             working_lf
-            .select(list(columns_for_soft_logging))
+            .select(list(columns_for_soft_logging) + ["_quarter"])
             .with_columns(soft_violation_exprs)
             .filter(data_warning_expr)
-            .collect()
         )
 
-        if not soft_error_rows_df.is_empty():
-            error_rows = soft_error_rows_df.to_dicts()
+        # For each violation type, group by quarter
+        for info in soft_violation_info:
+            flag = info["flag"]
+            error_type = info["error_type"]
 
-            for row in error_rows:
-                for info in soft_violation_info:
-                    if not row.get(info["flag"]):
-                        continue
+            # Build aggregation expressions based on error type
+            if error_type == "equity_mismatch":
+                total_col = info["total_col"]
+                component_cols = info["component_cols"]
 
+                agg_exprs = [
+                    polars.col(date_col).min().alias("date_range_start"),
+                    polars.col(date_col).max().alias("date_range_end"),
+                    polars.col(total_col).first().alias("total"),
+                    polars.len().alias("count")
+                ] + [polars.col(col).first().alias(col) for col in component_cols]
+
+            elif error_type == "accounting_equation_mismatch":
+                total_col = info["total_col"]
+                component_cols = info["component_cols"]
+
+                agg_exprs = [
+                    polars.col(date_col).min().alias("date_range_start"),
+                    polars.col(date_col).max().alias("date_range_end"),
+                    polars.col(total_col).first().alias("total"),
+                    polars.len().alias("count")
+                ] + [polars.col(col).first().alias(col) for col in component_cols]
+
+            elif error_type == "cash_mismatch":
+                cash_col_1 = info["cash_col_1"]
+                cash_col_2 = info["cash_col_2"]
+
+                agg_exprs = [
+                    polars.col(date_col).min().alias("date_range_start"),
+                    polars.col(date_col).max().alias("date_range_end"),
+                    polars.col(cash_col_1).first().alias(cash_col_1),
+                    polars.col(cash_col_2).first().alias(cash_col_2),
+                    polars.len().alias("count")
+                ]
+            else:
+                continue
+
+            quarter_warnings = (
+                soft_error_query
+                .filter(polars.col(flag))
+                .group_by("_quarter")
+                .agg(agg_exprs)
+                .sort("date_range_start")
+                .limit(MAX_LOGS)
+                .collect()
+            )
+
+            if quarter_warnings.height > 0:
+                warning_rows = quarter_warnings.to_dicts()
+
+                for row in warning_rows:
                     warning_entry = {
                         "ticker": ticker,
-                        "date": row.get(date_col),
-                        "error_type": info["error_type"]
+                        "quarter": row.get("_quarter"),
+                        "date_range_start": row.get("date_range_start"),
+                        "date_range_end": row.get("date_range_end"),
+                        "count": row.get("count"),
+                        "error_type": error_type
                     }
 
-                    if info["error_type"] == "equity_mismatch":
+                    if error_type == "equity_mismatch":
                         total_col = info["total_col"]
                         component_cols = info["component_cols"]
 
-                        total_val = row.get(total_col)
+                        total_val = row.get("total")
                         component_vals = {col: row.get(col) for col in component_cols}
                         component_sum_val = sum(component_vals.values())
 
@@ -820,11 +1003,11 @@ def validate_financial_equivalencies(
                         warning_entry["component_sum"] = component_sum_val
                         warning_entry["difference"] = total_val - component_sum_val
 
-                    elif info["error_type"] == "accounting_equation_mismatch":
+                    elif error_type == "accounting_equation_mismatch":
                         total_col = info["total_col"]
                         component_cols = info["component_cols"]
 
-                        total_val = row.get(total_col)
+                        total_val = row.get("total")
                         # Handle nulls as 0 for the report
                         component_vals = {col: (row.get(col) or 0.0) for col in component_cols}
                         component_sum_val = sum(component_vals.values())
@@ -834,7 +1017,7 @@ def validate_financial_equivalencies(
                         warning_entry["components"] = component_vals
                         warning_entry["difference"] = total_val - component_sum_val
 
-                    elif info["error_type"] == "cash_mismatch":
+                    elif error_type == "cash_mismatch":
                         cash_col_1 = info["cash_col_1"]
                         cash_col_2 = info["cash_col_2"]
 
@@ -859,6 +1042,9 @@ def validate_financial_equivalencies(
     if soft_violation_exprs:
         soft_flags_to_drop = [info["flag"] for info in soft_violation_info]
         working_lf = working_lf.drop(soft_flags_to_drop)
+
+    # Remove quarter column before returning
+    working_lf = working_lf.drop("_quarter")
 
     # Return in the same format as input
     result_df = working_lf if is_lazy else working_lf.collect()
