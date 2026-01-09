@@ -458,7 +458,7 @@ def run_full_pipeline(data: dict, save_data: bool, out_format: str, output_logs_
 
     logger.info(f"Successfully saved {len(saved_files)} corrected data files to {output_data_directory}")
 
-    return clean_lfs, stats_logs
+    return clean_lfs, sanity_logs, stats_logs
 
 
 
