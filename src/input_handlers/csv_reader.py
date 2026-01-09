@@ -199,8 +199,16 @@ def read_csv_files_to_polars(
                 )
 
             if date_cols_to_convert:
+                # Try multiple date formats to handle different CSV formats
+                # First attempt: MM/DD/YYYY (e.g., "07/01/2020")
+                # Second attempt: YYYY-MM-DD (e.g., "2020-07-01")
+                # Third attempt: DD/MM/YYYY (e.g., "01/07/2020")
                 date_expressions = [
-                    polars.col(c).str.to_date("%m/%d/%Y", strict=False).alias(c)
+                    polars.coalesce(
+                        polars.col(c).str.to_date("%m/%d/%Y", strict=False),
+                        polars.col(c).str.to_date("%Y-%m-%d", strict=False),
+                        polars.col(c).str.to_date("%d/%m/%Y", strict=False)
+                    ).alias(c)
                     for c in date_cols_to_convert
                 ]
                 frame = frame.with_columns(date_expressions)

@@ -24,9 +24,14 @@ def _add_quarter_column(
     schema = df.collect_schema() if is_lazy else df.schema
     col_dtype = schema.get(date_col)
 
-    # Parse date if it's a string
+    # Parse date if it's a string - try multiple formats
     if col_dtype == polars.String or col_dtype == polars.Utf8:
-        date_expr = polars.col(date_col).str.to_date("%m/%d/%Y", strict=False)
+        # Try multiple date formats: MM/DD/YYYY, YYYY-MM-DD, DD/MM/YYYY
+        date_expr = polars.coalesce(
+            polars.col(date_col).str.to_date("%m/%d/%Y", strict=False),
+            polars.col(date_col).str.to_date("%Y-%m-%d", strict=False),
+            polars.col(date_col).str.to_date("%d/%m/%Y", strict=False)
+        )
     else:
         date_expr = polars.col(date_col).cast(polars.Date, strict=False)
 
