@@ -7,6 +7,7 @@ from scipy.stats import t
 from numba import jit
 import math
 
+MAX_CORRECTIONS_LOG = 5
 
 # ---------------------------------------------------------
 # 1. Numba-Compiled Core with Student's t-Distribution
@@ -122,7 +123,6 @@ def garch_residuals(
 
     schema_cols = set(working_lf.collect_schema().names())
     logs = []
-    MAX_CORRECTIONS_LOG = 50
 
     if date_col not in schema_cols:
         logs.append({"ticker": ticker, "error_type": "missing_date", "message": f"Date column '{date_col}' not found"})

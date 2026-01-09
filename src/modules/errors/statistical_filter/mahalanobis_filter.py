@@ -7,6 +7,7 @@ from typing import Union, Optional
 from sklearn.covariance import MinCovDet, LedoitWolf
 from scipy.stats import chi2
 
+MAX_CORRECTIONS_LOG = 5
 
 class MetadataCache:
     """
@@ -376,7 +377,7 @@ def mahalanobis_filter(
     is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
     logs = []
-    MAX_CORRECTIONS_LOG = 50
+
 
     ticker_symbol = ticker.replace(".csv", "") if ticker.endswith(".csv") else ticker
 

@@ -4,6 +4,7 @@ from typing import Union
 from scipy.interpolate import CubicSpline
 from scipy.stats import norm
 
+MAX_CORRECTIONS_LOG = 5
 
 def rolling_z_score(
         df: Union[polars.DataFrame, polars.LazyFrame],
@@ -24,7 +25,7 @@ def rolling_z_score(
     # 1. Validation and Schema Check
     schema_cols = set(working_lf.collect_schema().names())
     logs = []
-    MAX_CORRECTIONS_LOG = 50
+
 
     if date_col not in schema_cols:
         logs.append({

@@ -4,6 +4,7 @@ from typing import Union
 from scipy.interpolate import CubicSpline
 from scipy.stats import norm  # Needed for critical value calculation
 
+MAX_CORRECTIONS_LOG = 5
 
 def mad_filter(
         df: Union[polars.DataFrame, polars.LazyFrame],
@@ -23,7 +24,6 @@ def mad_filter(
 
     schema_cols = set(working_lf.collect_schema().names())
     logs = []
-    MAX_CORRECTIONS_LOG = 50
 
     if date_col not in schema_cols:
         logs.append({"ticker": ticker, "error_type": "missing_date", "message": f"Date column '{date_col}' not found"})

@@ -2,7 +2,7 @@ import polars
 from typing import Union, Literal
 import logging
 
-MAX_LOGS = 10
+MAX_LOGS = 5
 
 
 def _add_quarter_column(

@@ -29,7 +29,8 @@ data_directory = current_dir / ".." / "Input" / "Data"
 metadata_path = current_dir / ".." / "Input" / "Universe_Information" / "Universe_Information.csv"
 output_logs_directory = current_dir / ".." / "Output"
 batch_size = 512
-max_files = 512
+max_files = 51200
+save_data = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ if __name__ == "__main__":
     }
 
 
-    def run_full_sanity_check():
+    def run_full_sanity_check(data: dict, save_data: bool) -> tuple[dict, dict]:
         date_cols = [
             "f_filing_date",
             "m_date",
@@ -123,7 +124,7 @@ if __name__ == "__main__":
         ]
 
         dataframe_dict_sorted_dates, unsorted_dates_logs = parallel_process_tickers(
-            data_dict=dataframe_dict,
+            data_dict=data,
             columns=date_cols,
             function=sort_dates,
             batch_size=batch_size
@@ -194,7 +195,7 @@ if __name__ == "__main__":
 
         return dataframe_dict_clean_split_consistency, logs
 
-    def run_full_statistical_filter():
+    def run_full_statistical_filter(data: dict, save_data: bool) -> tuple[dict, dict]:
         # 1. Rolling Statistics (20-60 Day Window)
         # Target: Time-Series Trends (Prices & Moving Averages)
         # These check against recent history (Mean +/- StdDev) to handle drift.
@@ -334,7 +335,7 @@ if __name__ == "__main__":
         ]
 
         dataframe_dict_clean_rolling, rolling_z_logs = parallel_process_tickers(
-            data_dict=dataframe_dict,
+            data_dict=data,
             columns=rolling_z_cols,
             function=rolling_z_score,
             batch_size=batch_size
@@ -360,26 +361,26 @@ if __name__ == "__main__":
                 logger.info(f"Metadata cache initialized with {len(metadata_cache._symbol_to_sector)} symbols")
 
         # Inject caches into shared_data so all parallel workers can access them
-        shared_data_with_cache = dict(dataframe_dict)
+        shared_data_with_cache = dict(dataframe_dict_clean_rolling)
         shared_data_with_cache["__sector_model_cache__"] = sector_cache
         shared_data_with_cache["__metadata_cache__"] = metadata_cache
         shared_data_with_cache["__schema_cache__"] = {}  # Pre-create schema cache dict
 
-        # dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
-        #     data_dict=dataframe_dict_clean_rolling,
-        #     columns=mahalanobis_cols,
-        #     function=mahalanobis_filter,
-        #     batch_size=batch_size,
-        #     shared_data=shared_data_with_cache  # Pass all ticker data + cache for cross-sectional peer analysis
-        # )
-
         dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
-            data_dict=dataframe_dict,
+            data_dict=dataframe_dict_clean_rolling,
             columns=mahalanobis_cols,
             function=mahalanobis_filter,
             batch_size=batch_size,
             shared_data=shared_data_with_cache  # Pass all ticker data + cache for cross-sectional peer analysis
         )
+
+        # dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
+        #     data_dict=dataframe_dict,
+        #     columns=mahalanobis_cols,
+        #     function=mahalanobis_filter,
+        #     batch_size=batch_size,
+        #     shared_data=shared_data_with_cache  # Pass all ticker data + cache for cross-sectional peer analysis
+        # )
 
         logger.info(f"Mahalanobis filter: {len(sector_cache)} sector models cached")
 
@@ -411,9 +412,9 @@ if __name__ == "__main__":
         return dataframe_dict_clean_garch, logs
 
 
-    clean_lfs, logs = run_full_sanity_check()
+    clean_lfs, logs = run_full_sanity_check(dataframe_dict, save_data = save_data)
 
-    # clean_lfs, logs = run_full_statistical_filter()
+    clean_lfs, logs = run_full_statistical_filter(clean_lfs, save_data = save_data)
 
 
     print("Data cleaning complete. Launching dashboard...")

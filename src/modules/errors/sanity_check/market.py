@@ -3,6 +3,8 @@ import numpy
 from typing import Union
 from scipy.interpolate import CubicSpline
 
+MAX_CORRECTIONS_LOG = 5
+
 
 def fill_negatives_market(
         df: Union[polars.DataFrame, polars.LazyFrame],
@@ -65,7 +67,6 @@ def fill_negatives_market(
     working_df = working_lf.select(needed_cols).sort(date_col).collect()
 
     corrections = []
-    MAX_CORRECTIONS_LOG = 50  # Limit log entries per column
 
     for col in available_cols:
         values = working_df[col].to_numpy().astype(numpy.float64)
@@ -172,12 +173,12 @@ def fill_negatives_market(
 
 
 def ohlc_integrity(
-    df: Union[polars.DataFrame, polars.LazyFrame],
-    metadata: polars.LazyFrame,
-    ticker: str,
-    columns: list[str] = [""],  # for backward compatibility, useless but do not eliminate
-    date_col: str = "m_date",
-    shared_data: dict = None  # Unused - for interface consistency
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
+        ticker: str,
+        columns: list[str] = [""],  # for backward compatibility, useless but do not eliminate
+        date_col: str = "m_date",
+        shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Validate and resolve OHLC data integrity issues:
@@ -316,15 +317,15 @@ def ohlc_integrity(
         # Check 3: VWAP within [Low, High]
         if has_vwap:
             ohlc_centroid = (
-                polars.col(open_col)
-                + polars.col(high_col)
-                + polars.col(low_col)
-                + polars.col(close_col)
-            ) / 4.0
+                                    polars.col(open_col)
+                                    + polars.col(high_col)
+                                    + polars.col(low_col)
+                                    + polars.col(close_col)
+                            ) / 4.0
 
             vwap_viol_name = f"_viol_{group_name}_vwap"
             vwap_viol_expr = (polars.col(vwap_col) < polars.col(low_col)) | (
-                polars.col(vwap_col) > polars.col(high_col)
+                    polars.col(vwap_col) > polars.col(high_col)
             )
             violation_exprs.append(vwap_viol_expr.alias(vwap_viol_name))
             correction_exprs.append(
@@ -364,10 +365,21 @@ def ohlc_integrity(
     if not error_rows_df.is_empty():
         error_rows = error_rows_df.to_dicts()
 
+        # LOGGING FIX: Initialize counter
+        corrections_count = 0
+
         for row in error_rows:
+            # LOGGING FIX: Check limit
+            if corrections_count >= MAX_CORRECTIONS_LOG:
+                break
+
             for info in violation_info:
                 if not row.get(info["col"]):
                     continue
+
+                # LOGGING FIX: Check limit again inside inner loop
+                if corrections_count >= MAX_CORRECTIONS_LOG:
+                    break
 
                 group = info["group"]
                 group_name = info["group_name"]
@@ -423,6 +435,7 @@ def ohlc_integrity(
                     )
 
                 resolutions.append(resolution_entry)
+                corrections_count += 1
 
     # Apply corrections (separate query, no violation flags in output)
     corrected_lf = working_lf.with_columns(correction_exprs)
@@ -430,15 +443,14 @@ def ohlc_integrity(
     return (corrected_lf, resolutions)
 
 
-
 def validate_market_split_consistency(
-    df: Union[polars.DataFrame, polars.LazyFrame],
-    metadata: polars.LazyFrame,
-    ticker: str,
-    columns: list[str] = [""],
-    date_col: str = "m_date",
-    tolerance: float = 0.01,
-    shared_data: dict = None  # Unused - for interface consistency
+        df: Union[polars.DataFrame, polars.LazyFrame],
+        metadata: polars.LazyFrame,
+        ticker: str,
+        columns: list[str] = [""],
+        date_col: str = "m_date",
+        tolerance: float = 0.01,
+        shared_data: dict = None  # Unused - for interface consistency
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
     Validate that the relationship between raw market data and split-adjusted market data
@@ -508,8 +520,8 @@ def validate_market_split_consistency(
 
     # Check for split columns first - if missing, we cannot validate
     has_split_cols = (
-        split_numerator_col in schema_cols and
-        split_denominator_col in schema_cols
+            split_numerator_col in schema_cols and
+            split_denominator_col in schema_cols
     )
 
     if not has_split_cols:
@@ -642,13 +654,13 @@ def validate_market_split_consistency(
         # Also check that both raw and adjusted are valid (not null/zero)
         violation_name = f"_viol_{raw_col}"
         violation_expr = (
-            polars.col(raw_col).is_not_null() &
-            (polars.col(raw_col) != 0) &
-            polars.col(adj_col).is_not_null() &
-            (
-                (polars.col(k_implied_name) - polars.col("_k_expected")).abs() >
-                (polars.col("_k_expected").abs() * tolerance)
-            )
+                polars.col(raw_col).is_not_null() &
+                (polars.col(raw_col) != 0) &
+                polars.col(adj_col).is_not_null() &
+                (
+                        (polars.col(k_implied_name) - polars.col("_k_expected")).abs() >
+                        (polars.col("_k_expected").abs() * tolerance)
+                )
         ).alias(violation_name)
 
         # Correction: recalculate adjusted = raw * K_expected
@@ -690,13 +702,13 @@ def validate_market_split_consistency(
         # Violation check
         violation_name = f"_viol_{raw_col}"
         violation_expr = (
-            polars.col(adj_col).is_not_null() &
-            (polars.col(adj_col) != 0) &
-            polars.col(raw_col).is_not_null() &
-            (
-                (polars.col(k_implied_name) - polars.col("_k_expected")).abs() >
-                (polars.col("_k_expected").abs() * tolerance)
-            )
+                polars.col(adj_col).is_not_null() &
+                (polars.col(adj_col) != 0) &
+                polars.col(raw_col).is_not_null() &
+                (
+                        (polars.col(k_implied_name) - polars.col("_k_expected")).abs() >
+                        (polars.col("_k_expected").abs() * tolerance)
+                )
         ).alias(violation_name)
 
         # Correction: recalculate adjusted = raw / K_expected
@@ -748,10 +760,21 @@ def validate_market_split_consistency(
         if not error_rows_df.is_empty():
             error_rows = error_rows_df.to_dicts()
 
+            # LOGGING FIX: Initialize counter
+            corrections_count = 0
+
             for row in error_rows:
+                # LOGGING FIX: Check limit
+                if corrections_count >= MAX_CORRECTIONS_LOG:
+                    break
+
                 for info in violation_info:
                     if not row.get(info["flag"]):
                         continue
+
+                    # LOGGING FIX: Check limit inside inner loop
+                    if corrections_count >= MAX_CORRECTIONS_LOG:
+                        break
 
                     raw_col = info["raw_col"]
                     adj_col = info["adj_col"]
@@ -781,10 +804,12 @@ def validate_market_split_consistency(
                         "k_expected": k_expected,
                         "k_implied": k_implied,
                         "daily_split_factor": daily_factor,
-                        "deviation": abs(k_implied - k_expected) if (k_implied is not None and k_expected is not None) else None,
+                        "deviation": abs(k_implied - k_expected) if (
+                                    k_implied is not None and k_expected is not None) else None,
                         "tolerance": tolerance,
                         "correction_method": "recalculated_from_k_expected"
                     })
+                    corrections_count += 1
 
         # Apply corrections
         working_lf = working_lf.with_columns(correction_exprs)
