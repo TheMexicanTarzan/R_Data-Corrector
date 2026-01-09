@@ -1,1 +1,1 @@
-from .dashboard import run_dashboard
+from .dashboard import run_dashboard, launch_dashboard
