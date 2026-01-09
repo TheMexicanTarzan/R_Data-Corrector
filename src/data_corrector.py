@@ -17,9 +17,10 @@ from src.modules.errors.statistical_filter import (
     garch_residuals,
     mahalanobis_filter,
     mad_filter,
-    rolling_z_score
+    rolling_z_score,
+    SectorModelCache,
+    MetadataCache
 )
-from src.modules.errors.statistical_filter.mahalanobis_filter import SectorModelCache
 from src.features import parallel_process_tickers, consolidate_audit_logs
 from src.dashboard import run_dashboard
 
@@ -332,21 +333,37 @@ if __name__ == "__main__":
             "c_log_returns_dividend_and_split_adjusted"
         ]
 
-        # dataframe_dict_clean_rolling, rolling_z_logs = parallel_process_tickers(
-        #     data_dict=dataframe_dict,
-        #     columns=rolling_z_cols,
-        #     function=rolling_z_score,
-        #     batch_size=batch_size
-        # )
+        dataframe_dict_clean_rolling, rolling_z_logs = parallel_process_tickers(
+            data_dict=dataframe_dict,
+            columns=rolling_z_cols,
+            function=rolling_z_score,
+            batch_size=batch_size
+        )
 
         # Create sector model cache for Mahalanobis filter optimization
         # This cache stores computed MCD models per sector, avoiding redundant
         # computation when multiple tickers from the same sector are processed.
         sector_cache = SectorModelCache()
 
-        # Inject cache into shared_data so all parallel workers can access it
+        # OPTIMIZATION: Pre-initialize metadata cache before parallel processing
+        # This builds O(1) lookup dictionaries for symbol->sector and sector->symbols
+        # reducing 40,000+ O(n) filter operations to 1 initial scan + O(1) lookups
+        metadata_cache = MetadataCache()
+
+        # Get metadata from first ticker to initialize the cache
+        first_ticker_data = next(iter(dataframe_dict.values()))
+        if isinstance(first_ticker_data, tuple) and len(first_ticker_data) > 1:
+            metadata_lf = first_ticker_data[1]
+            if metadata_lf is not None:
+                logger.info("Pre-initializing metadata cache for O(1) sector lookups...")
+                metadata_cache.initialize(metadata_lf)
+                logger.info(f"Metadata cache initialized with {len(metadata_cache._symbol_to_sector)} symbols")
+
+        # Inject caches into shared_data so all parallel workers can access them
         shared_data_with_cache = dict(dataframe_dict)
         shared_data_with_cache["__sector_model_cache__"] = sector_cache
+        shared_data_with_cache["__metadata_cache__"] = metadata_cache
+        shared_data_with_cache["__schema_cache__"] = {}  # Pre-create schema cache dict
 
         # dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
         #     data_dict=dataframe_dict_clean_rolling,
