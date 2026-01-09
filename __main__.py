@@ -7,7 +7,7 @@ from src import (
     run_full_sanity_check,
     run_full_statistical_filter,
     run_full_pipeline,
-    run_dashboard
+    launch_dashboard
     )
 current_dir = Path.cwd()
 data_directory = current_dir / "Input" / "Data"
@@ -40,10 +40,10 @@ original_file_paths = {
 #                                                    output_logs_directory=output_logs_directory,
 #                                                    batch_size=batch_size)
 
-clean_data_dict, logs_sanity, logs_stats = run_full_pipeline(dataframe_dict,
-                                          save_data=save_data,
-                                          out_format=out_format,
-                                          output_logs_directory=output_logs_directory,
-                                          batch_size=batch_size)
+# clean_data_dict, logs_sanity, logs_stats = run_full_pipeline(dataframe_dict,
+#                                           save_data=save_data,
+#                                           out_format=out_format,
+#                                           output_logs_directory=output_logs_directory,
+#                                           batch_size=batch_size)
 
-# run_dashboard(original_file_paths, clean_data_dict, logs, debug=False, port=8050)
+launch_dashboard()

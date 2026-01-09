@@ -22,7 +22,8 @@ from dash import Input, Output, State, dcc, html
 # CONSTANTS
 # ============================================================================
 
-ERROR_CATEGORIES = {
+# Sanity check error categories
+SANITY_CHECK_CATEGORIES = {
     "Date Sorting": "unsorted_dates_logs",
     "Negative Fundamentals": "negative_fundamentals_logs",
     "Negative Market Data": "negative_market_logs",
@@ -33,8 +34,21 @@ ERROR_CATEGORIES = {
     "Split Consistency": "split_inconsistencies_logs",
 }
 
-# Path for storing false positive flags
-FALSE_POSITIVES_FILE = Path(__file__).parent / "false_positives.json"
+# Statistical filter error categories
+STATISTICAL_FILTER_CATEGORIES = {
+    "Rolling Z-Score": "rolling_z_score_filter",
+    "Mahalanobis Distance": "mahalanobis_filter",
+    "MAD Filter": "mad_filter",
+    "GARCH Residuals": "garch_residuals_filter",
+}
+
+# Combined error categories (for backward compatibility and unified access)
+ERROR_CATEGORIES = {**SANITY_CHECK_CATEGORIES, **STATISTICAL_FILTER_CATEGORIES}
+
+# Path for storing false positive flags (relative to project root)
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+FALSE_POSITIVES_DIR = _PROJECT_ROOT / "output" / "full_pipeline" / "false_positives"
+FALSE_POSITIVES_FILE = FALSE_POSITIVES_DIR / "false_positives.json"
 
 # Maximum rows to display in the grid to prevent memory issues
 MAX_DISPLAY_ROWS = 500
@@ -117,6 +131,7 @@ def normalize_logs(logs: dict) -> polars.LazyFrame:
     - Flat lists (most logs)
     - Nested dicts by column (negative_fundamentals_logs)
     - Dict with hard_filter_errors/soft_filter_warnings (financial_unequivalencies_logs)
+    - Statistical filter logs (rolling_z_score, mahalanobis, mad, garch)
 
     Returns:
         LazyFrame with columns: ticker, date, error_category, error_type,
@@ -127,8 +142,8 @@ def normalize_logs(logs: dict) -> polars.LazyFrame:
 
     normalized_rows = []
 
-    # Process each log category
-    for category_name, log_key in ERROR_CATEGORIES.items():
+    # Process sanity check log categories
+    for category_name, log_key in SANITY_CHECK_CATEGORIES.items():
         log_data = logs.get(log_key, [])
 
         if not log_data:
@@ -148,6 +163,18 @@ def normalize_logs(logs: dict) -> polars.LazyFrame:
             # Standard flat list structure
             normalized_rows.extend(
                 _normalize_flat_logs(log_data, category_name, log_key)
+            )
+
+    # Process statistical filter log categories
+    for category_name, log_key in STATISTICAL_FILTER_CATEGORIES.items():
+        log_data = logs.get(log_key, [])
+
+        if not log_data:
+            continue
+
+        if isinstance(log_data, list):
+            normalized_rows.extend(
+                _normalize_statistical_filter_logs(log_data, category_name, log_key)
             )
 
     if not normalized_rows:
@@ -552,14 +579,195 @@ def _normalize_split_consistency_entry(entry: dict, category_name: str, ticker: 
     }
 
 
+# ============================================================================
+# STATISTICAL FILTER LOG NORMALIZERS
+# ============================================================================
+
+def _normalize_statistical_filter_logs(log_data: list, category_name: str, log_key: str) -> list[dict]:
+    """Normalize statistical filter logs (rolling_z_score, mahalanobis, mad, garch)."""
+    rows = []
+
+    if not isinstance(log_data, list):
+        return rows
+
+    for entry in log_data:
+        if not isinstance(entry, dict):
+            continue
+
+        ticker = entry.get("ticker", "")
+        date_val = entry.get("date") or entry.get("m_date")
+        error_type = entry.get("error_type", "")
+
+        if log_key == "rolling_z_score_filter":
+            rows.append(_normalize_rolling_z_score_entry(entry, category_name, ticker, date_val))
+        elif log_key == "mahalanobis_filter":
+            rows.append(_normalize_mahalanobis_entry(entry, category_name, ticker, date_val))
+        elif log_key == "mad_filter":
+            rows.append(_normalize_mad_entry(entry, category_name, ticker, date_val))
+        elif log_key == "garch_residuals_filter":
+            rows.append(_normalize_garch_entry(entry, category_name, ticker, date_val))
+        else:
+            # Generic fallback for unknown statistical filters
+            rows.append({
+                "ticker": ticker,
+                "date": serialize_date(date_val),
+                "error_category": category_name,
+                "error_type": error_type,
+                "column_involved": entry.get("column", ""),
+                "original_value": str(entry.get("original_value", "")),
+                "corrected_value": str(entry.get("corrected_value", "")),
+                "message": f"Statistical outlier detected",
+                "filter_type": "statistical",
+                "raw_log": json.dumps(entry, default=str),
+            })
+
+    return rows
+
+
+def _normalize_rolling_z_score_entry(entry: dict, category_name: str, ticker: str, date_val: Any) -> dict:
+    """Normalize rolling Z-score filter log entry."""
+    column = entry.get("column", "")
+    original_value = entry.get("original_value")
+    corrected_value = entry.get("corrected_value")
+    z_score = entry.get("z_score")
+    rolling_mean = entry.get("rolling_mean")
+    rolling_std = entry.get("rolling_std")
+    threshold = entry.get("threshold")
+    method = entry.get("method", "unknown")
+
+    # Build informative message
+    if z_score is not None:
+        message = f"Z-score={z_score:.2f} (threshold={threshold:.2f}), corrected via {method}"
+    else:
+        message = f"Rolling Z-score outlier corrected via {method}"
+
+    return {
+        "ticker": ticker,
+        "date": serialize_date(date_val),
+        "error_category": category_name,
+        "error_type": "rolling_z_outlier",
+        "column_involved": column,
+        "original_value": f"{original_value:.4f}" if original_value is not None else "",
+        "corrected_value": f"{corrected_value:.4f}" if corrected_value is not None else "",
+        "message": message,
+        "filter_type": "statistical",
+        "raw_log": json.dumps(entry, default=str),
+    }
+
+
+def _normalize_mahalanobis_entry(entry: dict, category_name: str, ticker: str, date_val: Any) -> dict:
+    """Normalize Mahalanobis distance filter log entry."""
+    column = entry.get("column", "")
+    original_value = entry.get("original_value")
+    corrected_value = entry.get("corrected_value")
+    mahalanobis_distance = entry.get("mahalanobis_distance") or entry.get("distance")
+    threshold = entry.get("threshold") or entry.get("critical_value")
+    method = entry.get("method", "unknown")
+    sector = entry.get("sector", "")
+
+    # Build informative message
+    if mahalanobis_distance is not None:
+        message = f"Mahalanobis dist={mahalanobis_distance:.2f}"
+        if threshold:
+            message += f" (threshold={threshold:.2f})"
+        if sector:
+            message += f", sector={sector}"
+    else:
+        message = f"Multivariate outlier detected"
+        if sector:
+            message += f" in sector {sector}"
+
+    return {
+        "ticker": ticker,
+        "date": serialize_date(date_val),
+        "error_category": category_name,
+        "error_type": entry.get("error_type", "mahalanobis_outlier"),
+        "column_involved": column,
+        "original_value": f"{original_value:.4f}" if isinstance(original_value, (int, float)) else str(original_value or ""),
+        "corrected_value": f"{corrected_value:.4f}" if isinstance(corrected_value, (int, float)) else str(corrected_value or ""),
+        "message": message,
+        "filter_type": "statistical",
+        "raw_log": json.dumps(entry, default=str),
+    }
+
+
+def _normalize_mad_entry(entry: dict, category_name: str, ticker: str, date_val: Any) -> dict:
+    """Normalize MAD (Modified Z-score) filter log entry."""
+    column = entry.get("column", "")
+    original_value = entry.get("original_value")
+    corrected_value = entry.get("corrected_value")
+    modified_z = entry.get("modified_z_score") or entry.get("z_score")
+    median = entry.get("median")
+    mad = entry.get("mad")
+    threshold = entry.get("threshold")
+    method = entry.get("method", "unknown")
+
+    # Build informative message
+    if modified_z is not None:
+        message = f"Modified Z={modified_z:.2f}"
+        if threshold:
+            message += f" (threshold={threshold:.2f})"
+        message += f", corrected via {method}"
+    else:
+        message = f"MAD outlier corrected via {method}"
+
+    return {
+        "ticker": ticker,
+        "date": serialize_date(date_val),
+        "error_category": category_name,
+        "error_type": entry.get("error_type", "mad_outlier"),
+        "column_involved": column,
+        "original_value": f"{original_value:.4f}" if isinstance(original_value, (int, float)) else str(original_value or ""),
+        "corrected_value": f"{corrected_value:.4f}" if isinstance(corrected_value, (int, float)) else str(corrected_value or ""),
+        "message": message,
+        "filter_type": "statistical",
+        "raw_log": json.dumps(entry, default=str),
+    }
+
+
+def _normalize_garch_entry(entry: dict, category_name: str, ticker: str, date_val: Any) -> dict:
+    """Normalize GARCH residuals filter log entry."""
+    column = entry.get("column", "")
+    original_value = entry.get("original_value")
+    corrected_value = entry.get("corrected_value")
+    standardized_residual = entry.get("standardized_residual") or entry.get("residual")
+    conditional_volatility = entry.get("conditional_volatility")
+    threshold = entry.get("threshold")
+    method = entry.get("method", "unknown")
+
+    # Build informative message
+    if standardized_residual is not None:
+        message = f"Std residual={standardized_residual:.2f}"
+        if threshold:
+            message += f" (threshold={threshold:.2f})"
+        if conditional_volatility:
+            message += f", cond_vol={conditional_volatility:.4f}"
+    else:
+        message = f"Volatility surprise detected"
+
+    return {
+        "ticker": ticker,
+        "date": serialize_date(date_val),
+        "error_category": category_name,
+        "error_type": entry.get("error_type", "garch_outlier"),
+        "column_involved": column,
+        "original_value": f"{original_value:.6f}" if isinstance(original_value, (int, float)) else str(original_value or ""),
+        "corrected_value": f"{corrected_value:.6f}" if isinstance(corrected_value, (int, float)) else str(corrected_value or ""),
+        "message": message,
+        "filter_type": "statistical",
+        "raw_log": json.dumps(entry, default=str),
+    }
+
+
 def get_unique_tickers(logs: dict) -> list[str]:
-    """Extract unique tickers from all logs."""
+    """Extract unique tickers from all logs (sanity check and statistical filter)."""
     # Preprocess logs from parallel processing first
     logs = _preprocess_parallel_logs(logs)
 
     tickers = set()
 
-    for log_key in ERROR_CATEGORIES.values():
+    # Process sanity check logs
+    for log_key in SANITY_CHECK_CATEGORIES.values():
         log_data = logs.get(log_key, [])
 
         if log_key == "negative_fundamentals_logs" and isinstance(log_data, dict):
@@ -574,6 +782,15 @@ def get_unique_tickers(logs: dict) -> list[str]:
                     if isinstance(entry, dict) and "ticker" in entry:
                         tickers.add(entry["ticker"])
         elif isinstance(log_data, list):
+            for entry in log_data:
+                if isinstance(entry, dict) and "ticker" in entry:
+                    tickers.add(entry["ticker"])
+
+    # Process statistical filter logs
+    for log_key in STATISTICAL_FILTER_CATEGORIES.values():
+        log_data = logs.get(log_key, [])
+
+        if isinstance(log_data, list):
             for entry in log_data:
                 if isinstance(entry, dict) and "ticker" in entry:
                     tickers.add(entry["ticker"])
@@ -597,8 +814,8 @@ def load_false_positives() -> dict:
 
 
 def save_false_positives(false_positives: dict) -> None:
-    """Save false positives to JSON file."""
-    FALSE_POSITIVES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Save false positives to JSON file in output/full_pipeline/false_positives/."""
+    FALSE_POSITIVES_DIR.mkdir(parents=True, exist_ok=True)
     with open(FALSE_POSITIVES_FILE, "w") as f:
         json.dump(false_positives, f, indent=2)
 
@@ -1666,6 +1883,280 @@ def create_app(
 
 
 # ============================================================================
+# CACHE-AWARE DATA LOADING FUNCTIONS
+# ============================================================================
+
+# Default paths (relative to project root)
+CORRECTED_DATA_DIR = _PROJECT_ROOT / "output" / "full_pipeline" / "corrected_data"
+RAW_DATA_DIR = _PROJECT_ROOT / "input" / "data"
+ERROR_LOGS_DIR = _PROJECT_ROOT / "output" / "full_pipeline" / "error_logs"
+
+
+def _is_cache_available() -> bool:
+    """
+    Check if corrected data exists in the cache directory.
+
+    Returns:
+        True if the directory exists and contains at least one CSV/Parquet file.
+    """
+    if not CORRECTED_DATA_DIR.exists():
+        return False
+
+    # Check for CSV or Parquet files
+    csv_files = list(CORRECTED_DATA_DIR.glob("*.csv"))
+    parquet_files = list(CORRECTED_DATA_DIR.glob("*.parquet"))
+
+    return len(csv_files) > 0 or len(parquet_files) > 0
+
+
+def _load_cached_data() -> tuple[dict[str, polars.LazyFrame], dict[str, Path], dict]:
+    """
+    Load corrected data from cache and match with raw input files.
+
+    Returns:
+        Tuple of:
+        - cleaned_dataframes: dict[ticker, LazyFrame] of corrected data
+        - original_file_paths: dict[ticker, Path] of raw input file paths
+        - logs: Combined sanity check and statistical filter logs from JSON files
+    """
+    from src.input_handlers.csv_reader import FINANCIAL_DATA_SCHEMA
+
+    cleaned_dataframes = {}
+    original_file_paths = {}
+
+    # Find all corrected data files
+    corrected_files = list(CORRECTED_DATA_DIR.glob("*.csv")) + list(CORRECTED_DATA_DIR.glob("*.parquet"))
+
+    for corrected_file in corrected_files:
+        # Extract ticker from filename (e.g., "AAPL.csv" -> "AAPL")
+        ticker = corrected_file.stem
+        filename = corrected_file.name
+
+        # Load corrected data as LazyFrame
+        try:
+            if corrected_file.suffix == ".parquet":
+                cleaned_dataframes[filename] = polars.scan_parquet(str(corrected_file))
+            else:
+                # Apply schema overrides for CSV files
+                temp_scan = polars.scan_csv(str(corrected_file), n_rows=1)
+                file_columns = temp_scan.collect_schema().names()
+
+                schema_overrides = {}
+                date_cols_to_convert = []
+
+                for col in file_columns:
+                    if col in FINANCIAL_DATA_SCHEMA:
+                        target_type = FINANCIAL_DATA_SCHEMA[col]
+                        if target_type == polars.Date:
+                            schema_overrides[col] = polars.String
+                            date_cols_to_convert.append(col)
+                        else:
+                            schema_overrides[col] = target_type
+                    else:
+                        schema_overrides[col] = polars.Float64
+
+                lf = polars.scan_csv(str(corrected_file), schema_overrides=schema_overrides)
+
+                # Convert date columns
+                if date_cols_to_convert:
+                    date_expressions = [
+                        polars.coalesce(
+                            polars.col(c).str.to_date("%m/%d/%Y", strict=False),
+                            polars.col(c).str.to_date("%Y-%m-%d", strict=False),
+                            polars.col(c).str.to_date("%d/%m/%Y", strict=False)
+                        ).alias(c)
+                        for c in date_cols_to_convert
+                    ]
+                    lf = lf.with_columns(date_expressions)
+
+                cleaned_dataframes[filename] = lf
+        except Exception as e:
+            print(f"Warning: Could not load corrected file {corrected_file}: {e}")
+            continue
+
+        # Find matching raw file in input directory
+        raw_file_csv = RAW_DATA_DIR / f"{ticker}.csv"
+        raw_file_parquet = RAW_DATA_DIR / f"{ticker}.parquet"
+
+        if raw_file_csv.exists():
+            original_file_paths[filename] = raw_file_csv
+        elif raw_file_parquet.exists():
+            original_file_paths[filename] = raw_file_parquet
+        else:
+            # Try case-insensitive match
+            for raw_file in RAW_DATA_DIR.glob("*"):
+                if raw_file.stem.lower() == ticker.lower():
+                    original_file_paths[filename] = raw_file
+                    break
+
+    # Load error logs from JSON files
+    logs = _load_cached_logs()
+
+    return cleaned_dataframes, original_file_paths, logs
+
+
+def _load_cached_logs() -> dict:
+    """
+    Load error logs from cached JSON files.
+
+    Returns:
+        Combined dict of sanity check and statistical filter logs.
+    """
+    logs = {}
+
+    # Load sanity check logs
+    sanity_log_file = ERROR_LOGS_DIR / "logs_sanity_check.json"
+    if sanity_log_file.exists():
+        try:
+            with open(sanity_log_file, "r") as f:
+                sanity_logs = json.load(f)
+                logs.update(sanity_logs)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not load sanity check logs: {e}")
+
+    # Load statistical filter logs
+    stats_log_file = ERROR_LOGS_DIR / "logs_statistical_filter.json"
+    if stats_log_file.exists():
+        try:
+            with open(stats_log_file, "r") as f:
+                stats_logs = json.load(f)
+                logs.update(stats_logs)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not load statistical filter logs: {e}")
+
+    return logs
+
+
+def launch_dashboard(
+    input_data_dir: Optional[Union[str, Path]] = None,
+    metadata_path: Optional[Union[str, Path]] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    run_pipeline_if_empty: bool = True,
+    save_data: bool = True,
+    out_format: str = "csv",
+    batch_size: int = 512,
+    debug: bool = True,
+    port: int = 8050,
+) -> None:
+    """
+    Launch the Data Corrector dashboard with cache-aware data loading.
+
+    This function implements the following logic:
+    1. Check if corrected data exists in output/full_pipeline/corrected_data/
+    2. If empty and run_pipeline_if_empty=True: run the full pipeline, use returned data
+    3. If data exists: load cached data and match with raw input files
+
+    Args:
+        input_data_dir: Path to raw input data directory (default: input/data)
+        metadata_path: Path to metadata CSV file
+        output_dir: Path to output directory (default: output)
+        run_pipeline_if_empty: Whether to run pipeline when no cached data exists
+        save_data: Whether to save pipeline output (if run)
+        out_format: Output format ('csv' or 'parquet')
+        batch_size: Batch size for pipeline processing
+        debug: Whether to run dashboard in debug mode
+        port: Port number for the dashboard server
+    """
+    from src.data_corrector import run_full_pipeline
+    from src.input_handlers import read_csv_files_to_polars
+
+    # Set default paths
+    if input_data_dir is None:
+        input_data_dir = RAW_DATA_DIR
+    else:
+        input_data_dir = Path(input_data_dir)
+
+    if output_dir is None:
+        output_dir = _PROJECT_ROOT / "output"
+    else:
+        output_dir = Path(output_dir)
+
+    if metadata_path is None:
+        metadata_path = _PROJECT_ROOT / "input" / "Universe_Information" / "Universe_Information.csv"
+    else:
+        metadata_path = Path(metadata_path)
+
+    # Check cache status
+    cache_available = _is_cache_available()
+
+    if cache_available:
+        print(f"{'='*60}")
+        print("Cache Check: Found existing corrected data")
+        print(f"Loading from: {CORRECTED_DATA_DIR}")
+        print(f"{'='*60}")
+
+        # Load cached data
+        cleaned_dataframes, original_file_paths, logs = _load_cached_data()
+
+        print(f"Loaded {len(cleaned_dataframes)} corrected files")
+        print(f"Matched {len(original_file_paths)} raw input files")
+
+    else:
+        print(f"{'='*60}")
+        print("Cache Check: No corrected data found")
+        print(f"Directory: {CORRECTED_DATA_DIR}")
+        print(f"{'='*60}")
+
+        if not run_pipeline_if_empty:
+            print("Error: No cached data and run_pipeline_if_empty=False")
+            print("Please run the pipeline first or set run_pipeline_if_empty=True")
+            return
+
+        print("Running full pipeline...")
+
+        # Load raw data
+        data = read_csv_files_to_polars(
+            directory_path=str(input_data_dir),
+            metadata_path=str(metadata_path),
+            lazy=True
+        )
+
+        if not data:
+            print("Error: No input data found")
+            return
+
+        # Run full pipeline
+        cleaned_data, sanity_logs, stats_logs = run_full_pipeline(
+            data=data,
+            save_data=save_data,
+            out_format=out_format,
+            output_logs_directory=output_dir,
+            batch_size=batch_size
+        )
+
+        # Prepare data for dashboard
+        cleaned_dataframes = {
+            ticker: df_tuple[0] if isinstance(df_tuple, tuple) else df_tuple
+            for ticker, df_tuple in cleaned_data.items()
+        }
+
+        # Build original file paths
+        original_file_paths = {}
+        for ticker in cleaned_dataframes.keys():
+            ticker_name = ticker.replace(".csv", "").replace(".parquet", "")
+            raw_file = input_data_dir / ticker
+            if raw_file.exists():
+                original_file_paths[ticker] = raw_file
+            else:
+                # Try with .csv extension
+                raw_file_csv = input_data_dir / f"{ticker_name}.csv"
+                if raw_file_csv.exists():
+                    original_file_paths[ticker] = raw_file_csv
+
+        # Combine logs
+        logs = {**sanity_logs, **stats_logs}
+
+    # Launch the dashboard
+    run_dashboard(
+        original_file_paths=original_file_paths,
+        cleaned_dataframes=cleaned_dataframes,
+        logs=logs,
+        debug=debug,
+        port=port
+    )
+
+
+# ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
 
@@ -1687,14 +2178,6 @@ def run_dashboard(
         port: Port number for the server
     """
     app = create_app(original_file_paths, cleaned_dataframes, logs)
-
-    print(f"\n{'='*60}")
-    print("Data Corrector Dashboard")
-    print(f"{'='*60}")
-    print(f"Starting server at http://127.0.0.1:{port}")
-    print(f"Loaded {len(original_file_paths)} ticker file paths (on-demand loading)")
-    print(f"Debug mode: {debug}")
-    print(f"{'='*60}\n")
 
     # Disable reloader to prevent re-running the entire data cleaning pipeline
     # The reloader spawns a child process that re-executes the script from the start
