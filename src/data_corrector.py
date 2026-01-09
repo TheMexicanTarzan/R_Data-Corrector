@@ -442,12 +442,12 @@ def run_full_pipeline(data: dict, save_data: bool, out_format: str, output_logs_
         with open(output_logs_directory / "full_pipeline" / "error_logs" / 'logs_sanity_check.json', 'w') as f:
             json.dump(sanity_logs, f, indent=4, default=str)
 
-        with open(output_logs_directory / "statistical_filter" / "error_logs" / 'logs_statistical_filter.json',
+        with open(output_logs_directory / "full_pipeline" / "error_logs" / 'logs_statistical_filter.json',
                   'w') as f:
             json.dump(stats_logs, f, indent=4, default=str)
 
         logger.info("Saving corrected data to CSV files...")
-        output_data_directory = output_logs_directory / "statistical_filter" / "corrected_data"
+        output_data_directory = output_logs_directory / "full_pipeline" / "corrected_data"
         saved_files = save_corrected_data(
             clean_data_dict=clean_lfs,
             output_directory=output_data_directory,
@@ -461,7 +461,6 @@ def run_full_pipeline(data: dict, save_data: bool, out_format: str, output_logs_
     return clean_lfs, stats_logs
 
 
-print("Data cleaning complete. Launching dashboard...")
 
 # Launch the dashboard with file paths for on-demand loading (memory efficient)
 # run_dashboard(
