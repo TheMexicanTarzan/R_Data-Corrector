@@ -425,7 +425,7 @@ def run_full_statistical_filter(data: dict, save_data: bool, out_format: str, ou
 
     return dataframe_dict_clean_garch, logs
 
-def run_half_pipeline(data: dict, save_data: bool, out_format: str, output_logs_directory, batch_size: int = 512):
+def run_full_pipeline(data: dict, save_data: bool, out_format: str, output_logs_directory, batch_size: int = 512):
     clean_lfs, sanity_logs = run_full_sanity_check(data,
                                             save_data = not save_data,
                                             out_format=out_format,
