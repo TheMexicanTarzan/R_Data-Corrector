@@ -143,6 +143,9 @@ def garch_residuals(
 
     modified_cols = {}
 
+    # Collect ALL outliers across all columns, then sort by severity
+    all_outlier_logs = []
+
     for col in available_cols:
         col_values = col_arrays[col]
         valid_mask = np.isfinite(col_values)
@@ -234,11 +237,10 @@ def garch_residuals(
             col_values[outlier_original_indices] = corrected_values_array
             modified_cols[col] = col_values
 
-            # Batch Logging
-            n_to_log = min(len(outlier_original_indices), MAX_CORRECTIONS_LOG)
-            resid_vals = std_resid[outlier_indices_returns[:n_to_log]]
+            # Collect ALL outliers with severity for later sorting
+            resid_vals = std_resid[outlier_indices_returns]
 
-            logs.extend([
+            all_outlier_logs.extend([
                 {
                     "ticker": ticker,
                     "date": dates[outlier_original_indices[i]],
@@ -248,14 +250,21 @@ def garch_residuals(
                     "corrected_value": float(corrected_values_array[i]),
                     "standardized_residual": float(resid_vals[i]),
                     "threshold": threshold,
-                    "method": method_used
+                    "method": method_used,
+                    "_severity": abs(float(resid_vals[i]))  # For sorting by most anomalous
                 }
-                for i in range(n_to_log)
+                for i in range(len(outlier_original_indices))
             ])
 
         except Exception as e:
             logs.append({"ticker": ticker, "column": col, "error_type": "garch_error", "message": str(e)})
             continue
+
+    # Sort by severity (highest |standardized residual| first) and keep top K most anomalous
+    all_outlier_logs.sort(key=lambda x: x["_severity"], reverse=True)
+    for log_entry in all_outlier_logs[:MAX_CORRECTIONS_LOG]:
+        del log_entry["_severity"]  # Remove internal sorting field
+        logs.append(log_entry)
 
     # Final DataFrame Construction
     if modified_cols:
