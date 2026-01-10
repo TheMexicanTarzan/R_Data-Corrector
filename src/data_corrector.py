@@ -1,6 +1,7 @@
 from pathlib import Path
 import logging
 import json
+import gc
 
 from src.input_handlers import read_csv_files_to_polars
 from src.modules.errors.sanity_check import (
@@ -18,8 +19,8 @@ from src.modules.errors.statistical_filter import (
     mahalanobis_filter,
     mad_filter,
     rolling_z_score,
-    SectorModelCache,
-    MetadataCache
+    MetadataCache,
+    compute_sector_model
 )
 from src.features import parallel_process_tickers, consolidate_audit_logs
 from src.dashboard import launch_dashboard
@@ -196,6 +197,169 @@ def run_full_sanity_check(data: dict, save_data: bool, out_format: str, output_l
 
     return dataframe_dict_clean_split_consistency, logs
 
+def _group_tickers_by_sector(data: dict, metadata_cache: MetadataCache) -> dict[str, list[str]]:
+    """
+    Group tickers by sector for serial processing.
+
+    Args:
+        data: Dictionary of ticker -> (LazyFrame, metadata) tuples
+        metadata_cache: Initialized metadata cache with sector mappings
+
+    Returns:
+        Dictionary mapping sector -> list of tickers in that sector
+    """
+    sector_to_tickers = {}
+
+    for ticker in data.keys():
+        ticker_symbol = ticker.replace(".csv", "") if ticker.endswith(".csv") else ticker
+        sector = metadata_cache.get_sector(ticker_symbol)
+
+        if sector is None:
+            # Put tickers without sector in a special "Unknown" group
+            sector = "Unknown"
+
+        if sector not in sector_to_tickers:
+            sector_to_tickers[sector] = []
+        sector_to_tickers[sector].append(ticker)
+
+    return sector_to_tickers
+
+def _process_mahalanobis_by_sector(
+        data: dict,
+        columns: list[str],
+        batch_size: int,
+        max_workers: int = 8,
+        confidence: float = 0.0001,
+        date_col: str = "m_date"
+) -> tuple[dict, list[dict]]:
+    """
+    Process Mahalanobis filtering using Sector-Based Hybrid Strategy.
+
+    Strategy:
+    1. Group tickers by sector (Serial execution per sector)
+    2. For each sector:
+       a. Load only that sector's data
+       b. Compute sector model once
+       c. Process all tickers in that sector in parallel
+       d. Clean up memory before moving to next sector
+
+    This avoids loading multiple sector models simultaneously (OOM prevention).
+
+    Args:
+        data: Dictionary of ticker -> (LazyFrame, metadata) tuples
+        columns: Columns to filter
+        batch_size: Batch size for parallel processing within sector
+        max_workers: Number of parallel workers per sector
+        confidence: Mahalanobis confidence threshold
+        date_col: Date column name
+
+    Returns:
+        Tuple of (cleaned_data_dict, all_audit_logs)
+    """
+    # Initialize metadata cache for sector lookups
+    metadata_cache = MetadataCache()
+    first_ticker_data = next(iter(data.values()))
+    if isinstance(first_ticker_data, tuple) and len(first_ticker_data) > 1:
+        metadata_lf = first_ticker_data[1]
+        if metadata_lf is not None:
+            logger.info("Initializing metadata cache for sector grouping...")
+            metadata_cache.initialize(metadata_lf)
+            logger.info(f"Metadata cache initialized with {len(metadata_cache._symbol_to_sector)} symbols")
+
+    # Group tickers by sector
+    logger.info("Grouping tickers by sector...")
+    sector_to_tickers = _group_tickers_by_sector(data, metadata_cache)
+    logger.info(f"Found {len(sector_to_tickers)} sectors to process")
+
+    # Process each sector serially
+    cleaned_data = {}
+    all_audit_logs = []
+
+    for sector_idx, (sector, tickers_in_sector) in enumerate(sector_to_tickers.items(), 1):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Processing Sector {sector_idx}/{len(sector_to_tickers)}: {sector}")
+        logger.info(f"Tickers in sector: {len(tickers_in_sector)}")
+        logger.info(f"{'='*80}")
+
+        # Extract only this sector's data (minimize memory footprint)
+        sector_data = {ticker: data[ticker] for ticker in tickers_in_sector}
+
+        # Prepare shared_data for this sector (contains all sector tickers for peer analysis)
+        shared_data_sector = dict(sector_data)
+        shared_data_sector["__metadata_cache__"] = metadata_cache
+        shared_data_sector["__schema_cache__"] = {}
+
+        # Compute sector model once (this is the expensive operation)
+        logger.info(f"Computing sector model for {sector}...")
+        peer_symbols = metadata_cache.get_peer_symbols(sector)
+
+        # Get available columns from first ticker in sector
+        first_ticker = tickers_in_sector[0]
+        first_payload = sector_data[first_ticker]
+        first_lf = first_payload[0] if isinstance(first_payload, tuple) else first_payload
+        first_schema = set(first_lf.collect_schema().names())
+        available_cols = [col for col in columns if col in first_schema]
+
+        if len(available_cols) < 2 or len(peer_symbols) < 2:
+            logger.warning(f"Skipping sector {sector}: insufficient columns or peers")
+            # Copy data through without filtering
+            for ticker in tickers_in_sector:
+                cleaned_data[ticker] = sector_data[ticker]
+            continue
+
+        # Compute the sector model
+        sector_model = compute_sector_model(
+            sector=sector,
+            peer_symbols=peer_symbols,
+            available_cols=available_cols,
+            date_col=date_col,
+            confidence=confidence,
+            shared_data=shared_data_sector,
+            schema_cache=shared_data_sector["__schema_cache__"]
+        )
+
+        if sector_model is None:
+            logger.warning(f"Failed to compute sector model for {sector}")
+            # Copy data through without filtering
+            for ticker in tickers_in_sector:
+                cleaned_data[ticker] = sector_data[ticker]
+            continue
+
+        # Inject pre-computed sector model into shared_data
+        shared_data_sector["__sector_model__"] = sector_model
+        logger.info(f"Sector model computed successfully for {sector}")
+
+        # Process all tickers in this sector in parallel
+        logger.info(f"Processing {len(tickers_in_sector)} tickers in parallel for sector {sector}...")
+        sector_cleaned, sector_logs = parallel_process_tickers(
+            data_dict=sector_data,
+            columns=columns,
+            function=mahalanobis_filter,
+            batch_size=batch_size,
+            max_workers=max_workers,
+            shared_data=shared_data_sector
+        )
+
+        # Merge results
+        cleaned_data.update(sector_cleaned)
+        all_audit_logs.extend(sector_logs)
+
+        logger.info(f"Sector {sector} complete. Processed {len(sector_cleaned)} tickers.")
+
+        # CRITICAL: Clean up memory before next sector
+        del sector_data
+        del sector_cleaned
+        del shared_data_sector
+        del sector_model
+        gc.collect()
+        logger.info(f"Memory cleaned for sector {sector}")
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"All sectors processed. Total tickers: {len(cleaned_data)}")
+    logger.info(f"{'='*80}\n")
+
+    return cleaned_data, all_audit_logs
+
 def run_full_statistical_filter(data: dict, save_data: bool, out_format: str, output_logs_directory, batch_size: int = 512) -> tuple[dict, dict]:
     # 1. Rolling Statistics (20-60 Day Window)
     # Target: Time-Series Trends (Prices & Moving Averages)
@@ -342,48 +506,20 @@ def run_full_statistical_filter(data: dict, save_data: bool, out_format: str, ou
         batch_size=batch_size
     )
 
-    # Create sector model cache for Mahalanobis filter optimization
-    # This cache stores computed MCD models per sector, avoiding redundant
-    # computation when multiple tickers from the same sector are processed.
-    sector_cache = SectorModelCache()
-
-    # OPTIMIZATION: Pre-initialize metadata cache before parallel processing
-    # This builds O(1) lookup dictionaries for symbol->sector and sector->symbols
-    # reducing 40,000+ O(n) filter operations to 1 initial scan + O(1) lookups
-    metadata_cache = MetadataCache()
-
-    # Get metadata from first ticker to initialize the cache
-    first_ticker_data = next(iter(data.values()))
-    if isinstance(first_ticker_data, tuple) and len(first_ticker_data) > 1:
-        metadata_lf = first_ticker_data[1]
-        if metadata_lf is not None:
-            logger.info("Pre-initializing metadata cache for O(1) sector lookups...")
-            metadata_cache.initialize(metadata_lf)
-            logger.info(f"Metadata cache initialized with {len(metadata_cache._symbol_to_sector)} symbols")
-
-    # Inject caches into shared_data so all parallel workers can access them
-    shared_data_with_cache = dict(dataframe_dict_clean_rolling)
-    shared_data_with_cache["__sector_model_cache__"] = sector_cache
-    shared_data_with_cache["__metadata_cache__"] = metadata_cache
-    shared_data_with_cache["__schema_cache__"] = {}  # Pre-create schema cache dict
-
-    dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
-        data_dict=dataframe_dict_clean_rolling,
+    # SECTOR-BASED HYBRID STRATEGY: Process Mahalanobis filter by sector
+    # - Iterate through sectors serially (one at a time)
+    # - Within each sector, process tickers in parallel
+    # - Clean up memory after each sector to prevent OOM
+    logger.info("Starting Sector-Based Mahalanobis filtering...")
+    dataframe_dict_clean_mahalanobis, mahalanobis_logs = _process_mahalanobis_by_sector(
+        data=dataframe_dict_clean_rolling,
         columns=mahalanobis_cols,
-        function=mahalanobis_filter,
         batch_size=batch_size,
-        shared_data=shared_data_with_cache  # Pass all ticker data + cache for cross-sectional peer analysis
+        max_workers=8,
+        confidence=0.0001,
+        date_col="m_date"
     )
-
-    # dataframe_dict_clean_mahalanobis, mahalanobis_logs = parallel_process_tickers(
-    #     data_dict=dataframe_dict,
-    #     columns=mahalanobis_cols,
-    #     function=mahalanobis_filter,
-    #     batch_size=batch_size,
-    #     shared_data=shared_data_with_cache  # Pass all ticker data + cache for cross-sectional peer analysis
-    # )
-
-    logger.info(f"Mahalanobis filter: {len(sector_cache)} sector models cached")
+    logger.info("Sector-Based Mahalanobis filtering complete")
 
     dataframe_dict_clean_mad, mad_logs = parallel_process_tickers(
         data_dict=dataframe_dict_clean_mahalanobis,
