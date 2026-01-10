@@ -40,10 +40,10 @@ clean_data_dict,logs = run_full_statistical_filter(dataframe_dict,
                                                    output_logs_directory=output_logs_directory,
                                                    batch_size=batch_size)
 
-# clean_data_dict, logs_sanity, logs_stats = run_full_pipeline(dataframe_dict,
-#                                           save_data=save_data,
-#                                           out_format=out_format,
-#                                           output_logs_directory=output_logs_directory,
-#                                           batch_size=batch_size)
+clean_data_dict, logs_sanity, logs_stats = run_full_pipeline(dataframe_dict,
+                                          save_data=save_data,
+                                          out_format=out_format,
+                                          output_logs_directory=output_logs_directory,
+                                          batch_size=batch_size)
 
 # launch_dashboard()

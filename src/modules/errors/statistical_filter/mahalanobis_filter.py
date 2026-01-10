@@ -1,7 +1,6 @@
 import polars
 import numpy
 import scipy.linalg
-import threading
 import warnings
 from typing import Union, Optional
 from sklearn.covariance import MinCovDet, LedoitWolf
@@ -16,43 +15,39 @@ class MetadataCache:
     Instead of filtering metadata LazyFrame for each ticker (O(n) per lookup),
     we build O(1) lookup dictionaries once and reuse them across all tickers.
 
-    For 20,000 tickers across 100 sectors:
-    - Before: 20,000 × 2 filter operations = 40,000 O(n) scans
-    - After: 1 initial scan + 20,000 O(1) dict lookups
+    Simplified version without thread locks since we process sectors serially.
     """
 
     def __init__(self):
         self._symbol_to_sector: dict[str, str] = {}
         self._sector_to_symbols: dict[str, list[str]] = {}
-        self._lock = threading.Lock()
         self._initialized = False
 
     def initialize(self, metadata: polars.LazyFrame) -> None:
         """Build lookup dictionaries from metadata LazyFrame (called once)."""
-        with self._lock:
-            if self._initialized:
-                return
+        if self._initialized:
+            return
 
-            try:
-                meta_df = metadata.select(["symbol", "sector"]).collect()
+        try:
+            meta_df = metadata.select(["symbol", "sector"]).collect()
 
-                for row in meta_df.iter_rows():
-                    symbol, sector = row[0], row[1]
-                    if symbol is None or sector is None:
-                        continue
+            for row in meta_df.iter_rows():
+                symbol, sector = row[0], row[1]
+                if symbol is None or sector is None:
+                    continue
 
-                    # Clean symbol (remove .csv suffix if present)
-                    clean_symbol = symbol.replace(".csv", "") if symbol.endswith(".csv") else symbol
+                # Clean symbol (remove .csv suffix if present)
+                clean_symbol = symbol.replace(".csv", "") if symbol.endswith(".csv") else symbol
 
-                    self._symbol_to_sector[clean_symbol] = sector
+                self._symbol_to_sector[clean_symbol] = sector
 
-                    if sector not in self._sector_to_symbols:
-                        self._sector_to_symbols[sector] = []
-                    self._sector_to_symbols[sector].append(clean_symbol)
+                if sector not in self._sector_to_symbols:
+                    self._sector_to_symbols[sector] = []
+                self._sector_to_symbols[sector].append(clean_symbol)
 
-                self._initialized = True
-            except Exception:
-                pass
+            self._initialized = True
+        except Exception:
+            pass
 
     def get_sector(self, symbol: str) -> Optional[str]:
         """O(1) lookup of sector for a symbol."""
@@ -65,63 +60,6 @@ class MetadataCache:
 
     def is_initialized(self) -> bool:
         return self._initialized
-
-
-class SectorModelCache:
-    """Thread-safe cache for sector-level Mahalanobis models."""
-
-    def __init__(self):
-        self._cache = {}
-        self._lock = threading.Lock()
-        self._computing = {}
-
-    def get(self, sector: str) -> Optional[dict]:
-        with self._lock:
-            return self._cache.get(sector)
-
-    def set(self, sector: str, model: dict) -> None:
-        with self._lock:
-            self._cache[sector] = model
-            if sector in self._computing:
-                del self._computing[sector]
-
-    def get_or_compute(self, sector: str, compute_fn) -> Optional[dict]:
-        model = self.get(sector)
-        if model is not None:
-            return model
-
-        with self._lock:
-            if sector in self._cache:
-                return self._cache[sector]
-            if sector in self._computing:
-                event = self._computing[sector]
-            else:
-                event = threading.Event()
-                self._computing[sector] = event
-                event = None
-
-        if event is not None:
-            event.wait(timeout=300)
-            return self.get(sector)
-
-        try:
-            model = compute_fn()
-            if model is not None:
-                self.set(sector, model)
-            return model
-        finally:
-            with self._lock:
-                if sector in self._computing:
-                    self._computing[sector].set()
-                    del self._computing[sector]
-
-    def clear(self) -> None:
-        with self._lock:
-            self._cache.clear()
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._cache)
 
 
 # OPTIMIZATION: Pre-compute quarter ID as integer (faster than string)
@@ -297,7 +235,7 @@ def _train_mcd_model(
     }
 
 
-def _compute_sector_model(
+def compute_sector_model(
         sector: str,
         peer_symbols: list[str],
         available_cols: list[str],
@@ -307,9 +245,10 @@ def _compute_sector_model(
         schema_cache: dict = None
 ) -> Optional[dict]:
     """
-    OPTIMIZED: Compute sector model with schema caching.
+    Compute sector model for Mahalanobis filtering.
 
-    Now includes pre-computed ticker z-score data for O(1) ticker lookups.
+    Simplified version without caching - called once per sector in serial mode.
+    Pre-computes ticker z-score data for O(1) ticker lookups during filtering.
     """
     pooled_q_df = _build_sector_quarterly_data(
         peer_symbols, available_cols, date_col, shared_data, schema_cache
@@ -332,8 +271,7 @@ def _compute_sector_model(
 
     chi2_thresh = chi2.ppf(1 - confidence, df=len(valid_cols))
 
-    # OPTIMIZATION: Pre-compute per-ticker z-score data
-    # Group normalized_df by ticker for O(1) lookup later
+    # Pre-compute per-ticker z-score data for O(1) lookup during filtering
     ticker_z_data = {}
     for ticker in normalized_df["ticker"].unique().to_list():
         ticker_df = normalized_df.filter(polars.col("ticker") == ticker)
@@ -353,7 +291,9 @@ def _compute_sector_model(
         "robust_prec": mcd_result["robust_prec"],
         "chi2_thresh": chi2_thresh,
         "date_col": date_col,
-        "ticker_z_data": ticker_z_data  # OPTIMIZATION: Pre-computed per-ticker data
+        "ticker_z_data": ticker_z_data,
+        "sector": sector,
+        "peer_symbols": peer_symbols
     }
 
 
@@ -367,21 +307,20 @@ def mahalanobis_filter(
         shared_data: dict = None
 ) -> tuple[Union[polars.DataFrame, polars.LazyFrame], list[dict]]:
     """
-    OPTIMIZED Mahalanobis filter with:
-    1. Metadata caching (O(1) lookups instead of O(n) filters)
-    2. Schema caching (avoid repeated collect_schema calls)
-    3. Integer quarter IDs (faster than string concatenation)
-    4. Pre-computed per-ticker z-score data
-    5. Reduced memory allocations in hot paths
+    Mahalanobis filter using pre-computed sector model.
+
+    Simplified version for sector-based serial processing:
+    - Expects pre-computed sector model in shared_data["__sector_model__"]
+    - No caching needed since each sector is processed once
+    - Parallelizes filtering within the sector's tickers
     """
     is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
     logs = []
 
-
     ticker_symbol = ticker.replace(".csv", "") if ticker.endswith(".csv") else ticker
 
-    # OPTIMIZATION: Cache schema lookups
+    # Get schema
     schema_cache = shared_data.get("__schema_cache__") if shared_data else None
     if schema_cache is None and shared_data is not None:
         schema_cache = {}
@@ -407,51 +346,10 @@ def mahalanobis_filter(
     if shared_data is None:
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # OPTIMIZATION: Use metadata cache for O(1) lookups
-    meta_cache = shared_data.get("__metadata_cache__")
-    if meta_cache is None:
-        meta_cache = MetadataCache()
-        meta_cache.initialize(metadata)
-        shared_data["__metadata_cache__"] = meta_cache
-    elif not meta_cache.is_initialized():
-        meta_cache.initialize(metadata)
-
-    target_sector = meta_cache.get_sector(ticker_symbol)
-    if target_sector is None:
-        return (working_lf.collect() if not is_lazy else working_lf, logs)
-
-    peer_symbols = meta_cache.get_peer_symbols(target_sector)
-    if len(peer_symbols) < 2:
-        return (working_lf.collect() if not is_lazy else working_lf, logs)
-
-    cache = shared_data.get("__sector_model_cache__")
-
-    if cache is not None:
-        def compute_fn():
-            return _compute_sector_model(
-                sector=target_sector,
-                peer_symbols=peer_symbols,
-                available_cols=available_cols,
-                date_col=date_col,
-                confidence=confidence,
-                shared_data=shared_data,
-                schema_cache=schema_cache
-            )
-
-        sector_model = cache.get_or_compute(target_sector, compute_fn)
-    else:
-        sector_model = _compute_sector_model(
-            sector=target_sector,
-            peer_symbols=peer_symbols,
-            available_cols=available_cols,
-            date_col=date_col,
-            confidence=confidence,
-            shared_data=shared_data,
-            schema_cache=schema_cache
-        )
-
+    # Get pre-computed sector model from shared_data
+    sector_model = shared_data.get("__sector_model__")
     if sector_model is None:
-        logs.append({"ticker": ticker, "error_type": "sector_model_fail", "message": "Could not build sector model"})
+        logs.append({"ticker": ticker, "error_type": "no_sector_model", "message": "No pre-computed sector model"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     valid_cols = sector_model["valid_cols"]
@@ -526,8 +424,11 @@ def mahalanobis_filter(
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     # Build correction map using target_z_df
+    # Ensure target_z_df is a LazyFrame for compatibility with lazy joins
+    target_z_lf = target_z_df if isinstance(target_z_df, polars.LazyFrame) else target_z_df.lazy()
+
     corrected_map = (
-        target_z_df
+        target_z_lf
         .sort(date_col)
         .select(["_quarter_id"] + valid_cols)
         .with_columns([
