@@ -272,7 +272,12 @@ def compute_sector_model(
     chi2_thresh = chi2.ppf(1 - confidence, df=len(valid_cols))
 
     # Pre-compute per-ticker z-score data for O(1) lookup during filtering
+    # MEMORY OPTIMIZATION: Store only minimal columns needed for correction map
+    # instead of the entire DataFrame to prevent memory explosion with large sectors
     ticker_z_data = {}
+    # Correction map needs: date_col (for sorting), _quarter_id (for joining), valid_cols (for values)
+    correction_cols = [date_col, "_quarter_id"] + valid_cols
+    available_correction_cols = [c for c in correction_cols if c in normalized_df.columns]
     for ticker in normalized_df["ticker"].unique().to_list():
         ticker_df = normalized_df.filter(polars.col("ticker") == ticker)
         if not ticker_df.is_empty():
@@ -280,7 +285,8 @@ def compute_sector_model(
                 "z_matrix": ticker_df.select(z_cols).to_numpy(),
                 "quarter_ids": ticker_df["_quarter_id"].to_list(),
                 "dates": ticker_df[date_col].to_list() if date_col in ticker_df.columns else [],
-                "df": ticker_df
+                # Store only columns needed for correction map (not full DataFrame)
+                "correction_df": ticker_df.select(available_correction_cols)
             }
 
     return {
@@ -365,7 +371,8 @@ def mahalanobis_filter(
         target_mat = ticker_data["z_matrix"]
         q_ids = ticker_data["quarter_ids"]
         dates = ticker_data["dates"]
-        target_z_df = ticker_data["df"]
+        # Use minimal correction_df (contains only date_col, _quarter_id, valid_cols)
+        target_z_df = ticker_data["correction_df"]
     else:
         # Fallback to original method
         normalized_df = sector_model["normalized_df"]
