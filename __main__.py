@@ -15,7 +15,7 @@ metadata_path = current_dir / "Input" / "Universe_Information" / "Universe_Infor
 output_logs_directory = current_dir / "Output"
 out_format = "csv"
 batch_size = 512
-max_files = 5
+max_files = 51200
 save_data = True
 
 logging.basicConfig(level=logging.INFO)
@@ -34,11 +34,11 @@ original_file_paths = {
 #                                               output_logs_directory=output_logs_directory,
 #                                               batch_size=batch_size)
 
-# clean_data_dict,logs = run_full_statistical_filter(dataframe_dict,
-#                                                    save_data=save_data,
-#                                                    out_format=out_format,
-#                                                    output_logs_directory=output_logs_directory,
-#                                                    batch_size=batch_size)
+clean_data_dict,logs = run_full_statistical_filter(dataframe_dict,
+                                                   save_data=save_data,
+                                                   out_format=out_format,
+                                                   output_logs_directory=output_logs_directory,
+                                                   batch_size=batch_size)
 
 # clean_data_dict, logs_sanity, logs_stats = run_full_pipeline(dataframe_dict,
 #                                           save_data=save_data,
@@ -46,4 +46,4 @@ original_file_paths = {
 #                                           output_logs_directory=output_logs_directory,
 #                                           batch_size=batch_size)
 
-launch_dashboard()
+# launch_dashboard()
