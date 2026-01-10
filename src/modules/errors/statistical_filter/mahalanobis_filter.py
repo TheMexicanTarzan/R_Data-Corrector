@@ -424,8 +424,11 @@ def mahalanobis_filter(
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
     # Build correction map using target_z_df
+    # Ensure target_z_df is a LazyFrame for compatibility with lazy joins
+    target_z_lf = target_z_df if isinstance(target_z_df, polars.LazyFrame) else target_z_df.lazy()
+
     corrected_map = (
-        target_z_df
+        target_z_lf
         .sort(date_col)
         .select(["_quarter_id"] + valid_cols)
         .with_columns([
