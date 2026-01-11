@@ -46,8 +46,9 @@ STATISTICAL_FILTER_CATEGORIES = {
 ERROR_CATEGORIES = {**SANITY_CHECK_CATEGORIES, **STATISTICAL_FILTER_CATEGORIES}
 
 # Path for storing false positive flags (relative to project root)
+# NOTE: Path casing must match data_corrector.py which uses "Output" and "Input"
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
-FALSE_POSITIVES_DIR = _PROJECT_ROOT / "output" / "full_pipeline" / "false_positives"
+FALSE_POSITIVES_DIR = _PROJECT_ROOT / "Output" / "full_pipeline" / "false_positives"
 FALSE_POSITIVES_FILE = FALSE_POSITIVES_DIR / "false_positives.json"
 
 # Maximum rows to display in the grid to prevent memory issues
@@ -63,6 +64,37 @@ def serialize_date(value: Any) -> str:
     if isinstance(value, (date, datetime)):
         return value.strftime("%Y-%m-%d")
     return str(value) if value is not None else ""
+
+
+def _unwrap_consolidated_logs(logs: dict) -> dict:
+    """
+    Unwrap logs from the consolidated format produced by consolidate_audit_logs().
+
+    The consolidate_audit_logs() function wraps each log category in a
+    {"summary": {...}, "data": ...} structure. This function extracts the "data"
+    portion for each category.
+
+    Handles both:
+    - Already-unwrapped logs (for backward compatibility)
+    - Consolidated format logs (new format from consolidate_audit_logs)
+
+    Args:
+        logs: Dictionary of log category -> log data (either raw or consolidated)
+
+    Returns:
+        Dictionary with each category's "data" extracted if it was in consolidated format
+    """
+    unwrapped = {}
+
+    for log_key, log_value in logs.items():
+        if isinstance(log_value, dict) and "data" in log_value and "summary" in log_value:
+            # This is a consolidated format - extract the "data" portion
+            unwrapped[log_key] = log_value["data"]
+        else:
+            # Already in raw format or unknown structure - keep as-is
+            unwrapped[log_key] = log_value
+
+    return unwrapped
 
 
 def _preprocess_parallel_logs(logs: dict) -> dict:
@@ -132,12 +164,15 @@ def normalize_logs(logs: dict) -> polars.LazyFrame:
     - Nested dicts by column (negative_fundamentals_logs)
     - Dict with hard_filter_errors/soft_filter_warnings (financial_unequivalencies_logs)
     - Statistical filter logs (rolling_z_score, mahalanobis, mad, garch)
+    - Consolidated format from consolidate_audit_logs() (new format with summary/data)
 
     Returns:
         LazyFrame with columns: ticker, date, error_category, error_type,
         column_involved, original_value, corrected_value, message, raw_log
     """
-    # Preprocess logs from parallel processing
+    # First unwrap consolidated logs format (extracts "data" from {summary, data})
+    logs = _unwrap_consolidated_logs(logs)
+    # Then preprocess logs from parallel processing
     logs = _preprocess_parallel_logs(logs)
 
     normalized_rows = []
@@ -761,7 +796,9 @@ def _normalize_garch_entry(entry: dict, category_name: str, ticker: str, date_va
 
 def get_unique_tickers(logs: dict) -> list[str]:
     """Extract unique tickers from all logs (sanity check and statistical filter)."""
-    # Preprocess logs from parallel processing first
+    # First unwrap consolidated logs format (extracts "data" from {summary, data})
+    logs = _unwrap_consolidated_logs(logs)
+    # Then preprocess logs from parallel processing
     logs = _preprocess_parallel_logs(logs)
 
     tickers = set()
@@ -1887,9 +1924,10 @@ def create_app(
 # ============================================================================
 
 # Default paths (relative to project root)
-CORRECTED_DATA_DIR = _PROJECT_ROOT / "output" / "full_pipeline" / "corrected_data"
-RAW_DATA_DIR = _PROJECT_ROOT / "input" / "data"
-ERROR_LOGS_DIR = _PROJECT_ROOT / "output" / "full_pipeline" / "error_logs"
+# NOTE: Path casing must match data_corrector.py which uses "Output" and "Input/Data"
+CORRECTED_DATA_DIR = _PROJECT_ROOT / "Output" / "full_pipeline" / "corrected_data"
+RAW_DATA_DIR = _PROJECT_ROOT / "Input" / "Data"
+ERROR_LOGS_DIR = _PROJECT_ROOT / "Output" / "full_pipeline" / "error_logs"
 
 
 def _is_cache_available() -> bool:
@@ -2067,12 +2105,12 @@ def launch_dashboard(
         input_data_dir = Path(input_data_dir)
 
     if output_dir is None:
-        output_dir = _PROJECT_ROOT / "output"
+        output_dir = _PROJECT_ROOT / "Output"
     else:
         output_dir = Path(output_dir)
 
     if metadata_path is None:
-        metadata_path = _PROJECT_ROOT / "input" / "Universe_Information" / "Universe_Information.csv"
+        metadata_path = _PROJECT_ROOT / "Input" / "Universe_Information" / "Universe_Information.csv"
     else:
         metadata_path = Path(metadata_path)
 
