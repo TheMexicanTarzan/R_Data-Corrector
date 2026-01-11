@@ -76,15 +76,16 @@ def _build_sector_quarterly_data(
         schema_cache: dict = None
 ) -> Optional[polars.DataFrame]:
     """
-    OPTIMIZED: Builds quarterly data using Lazy execution and Direct Lookup.
+    Builds quarterly data by collecting each ticker individually.
 
-    Key optimizations:
-    1. Direct dict lookup O(K) instead of scan O(N)
-    2. Schema caching to avoid repeated collect_schema() calls
-    3. Integer quarter IDs (faster than string concatenation)
-    4. Single materialization at the end
+    MEMORY OPTIMIZATION: Instead of concatenating 1000+ LazyFrames and collecting
+    at once (which processes all tickers' daily data concurrently), we collect
+    each ticker AFTER aggregation. This means:
+    - Only one ticker's daily data is in memory at a time
+    - After .collect(), daily data is released, only ~40 quarterly rows remain
+    - Final concat is on small DataFrames (~27MB total for 1000+ tickers)
     """
-    lazy_frames = []
+    collected_frames = []
 
     if schema_cache is None:
         schema_cache = {}
@@ -109,7 +110,7 @@ def _build_sector_quarterly_data(
             cols_curr = [c for c in [date_col] + available_cols if c in peer_schema]
 
             if len(cols_curr) > 1:
-                # OPTIMIZATION: Use integer quarter ID instead of string
+                # Build query: select -> add quarter_id -> aggregate to quarterly
                 q_peer = (
                     peer_lf
                     .select(cols_curr)
@@ -124,14 +125,17 @@ def _build_sector_quarterly_data(
                         *[polars.col(c).last() for c in cols_curr if c != date_col]
                     ])
                 )
-                lazy_frames.append(q_peer)
+                # MEMORY FIX: Collect immediately after aggregation.
+                # This materializes only ~40 quarterly rows, releasing daily data.
+                collected_frames.append(q_peer.collect())
         except Exception:
             continue
 
-    if len(lazy_frames) < 2:
+    if len(collected_frames) < 2:
         return None
 
-    return polars.concat(lazy_frames, how="diagonal").collect()
+    # Concat small DataFrames (not LazyFrames) - total ~48k rows for 1000+ tickers
+    return polars.concat(collected_frames, how="diagonal")
 
 
 def _normalize_quarterly_data(
