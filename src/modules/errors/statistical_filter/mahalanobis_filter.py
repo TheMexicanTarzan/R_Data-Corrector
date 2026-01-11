@@ -251,8 +251,13 @@ def compute_sector_model(
     """
     Compute sector model for Mahalanobis filtering.
 
-    Simplified version without caching - called once per sector in serial mode.
-    Pre-computes ticker z-score data for O(1) ticker lookups during filtering.
+    MEMORY OPTIMIZATION: Store only the minimal data needed for filtering:
+    - MCD model parameters (robust_loc, robust_prec)
+    - Column metadata (valid_cols, z_cols)
+    - Threshold value
+
+    The normalized_df is converted to a lightweight lookup structure that
+    only stores the essential data needed for per-ticker filtering.
     """
     pooled_q_df = _build_sector_quarterly_data(
         peer_symbols, available_cols, date_col, shared_data, schema_cache
@@ -265,23 +270,42 @@ def compute_sector_model(
         pooled_q_df, available_cols
     )
 
+    # Free the pooled quarterly data immediately
+    del pooled_q_df
+
     if normalized_df.is_empty():
         return None
 
     mcd_result = _train_mcd_model(normalized_df, z_cols, valid_cols)
 
     if mcd_result is None:
+        del normalized_df
         return None
 
     chi2_thresh = chi2.ppf(1 - confidence, df=len(valid_cols))
 
-    # MEMORY OPTIMIZATION: Do NOT pre-compute per-ticker data here.
-    # Pre-computing ticker_z_data for large sectors (1000+ tickers) creates
-    # thousands of numpy arrays and DataFrames, causing memory explosion.
-    # Instead, compute on-demand in mahalanobis_filter() for each ticker.
+    # MEMORY OPTIMIZATION: Convert normalized_df to a dictionary keyed by ticker
+    # This allows O(1) lookup per ticker and we can delete the full DataFrame.
+    # We store only the minimal columns needed: ticker, _quarter_id, date_col, z_cols
+    ticker_data_lookup = {}
+    keep_cols = ["ticker", "_quarter_id", date_col] + z_cols
+
+    # Group by ticker and store only what's needed
+    for ticker_symbol in normalized_df["ticker"].unique().to_list():
+        ticker_rows = normalized_df.filter(polars.col("ticker") == ticker_symbol)
+        if not ticker_rows.is_empty():
+            # Store as a lightweight dict with numpy arrays
+            ticker_data_lookup[ticker_symbol] = {
+                "quarter_ids": ticker_rows["_quarter_id"].to_list(),
+                "dates": ticker_rows[date_col].to_list() if date_col in ticker_rows.columns else [],
+                "z_matrix": ticker_rows.select(z_cols).to_numpy()
+            }
+
+    # Free the full normalized DataFrame
+    del normalized_df
 
     return {
-        "normalized_df": normalized_df,
+        "ticker_data_lookup": ticker_data_lookup,
         "valid_cols": valid_cols,
         "z_cols": z_cols,
         "robust_loc": mcd_result["robust_loc"],
@@ -305,10 +329,8 @@ def mahalanobis_filter(
     """
     Mahalanobis filter using pre-computed sector model.
 
-    Simplified version for sector-based serial processing:
-    - Expects pre-computed sector model in shared_data["__sector_model__"]
-    - No caching needed since each sector is processed once
-    - Parallelizes filtering within the sector's tickers
+    MEMORY OPTIMIZATION: Uses ticker_data_lookup for O(1) ticker access
+    instead of filtering a large normalized_df each time.
     """
     is_lazy = isinstance(df, polars.LazyFrame)
     working_lf = df if is_lazy else df.lazy()
@@ -354,44 +376,42 @@ def mahalanobis_filter(
     robust_prec = sector_model["robust_prec"]
     chi2_thresh = sector_model["chi2_thresh"]
 
-    # MEMORY OPTIMIZATION: Compute on-demand for this ticker only.
-    # This avoids pre-computing data for 1000+ tickers which causes OOM.
-    normalized_df = sector_model["normalized_df"]
-    target_z_df = normalized_df.filter(polars.col("ticker") == ticker_symbol)
+    # MEMORY OPTIMIZATION: Use ticker_data_lookup for O(1) access
+    ticker_data_lookup = sector_model.get("ticker_data_lookup", {})
+    ticker_data = ticker_data_lookup.get(ticker_symbol)
 
-    if target_z_df.is_empty():
-        logs.append({"ticker": ticker, "error_type": "insufficient_history", "message": "Not enough overlapping peers"})
+    if ticker_data is None:
+        logs.append({"ticker": ticker, "error_type": "insufficient_history", "message": "Ticker not in sector model"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    target_mat = target_z_df.select(z_cols).to_numpy()
-    q_ids = target_z_df["_quarter_id"].to_list()
-    dates = target_z_df[date_col].to_list() if date_col in target_z_df.columns else []
+    q_ids = ticker_data["quarter_ids"]
+    dates = ticker_data["dates"]
+    target_mat = ticker_data["z_matrix"]
 
     if target_mat is None or len(target_mat) == 0:
         logs.append({"ticker": ticker, "error_type": "insufficient_history", "message": "Not enough overlapping peers"})
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # OPTIMIZATION: Vectorized distance computation with pre-allocated array
+    # Vectorized distance computation
     n_rows = len(target_mat)
     distances = numpy.full(n_rows, numpy.nan, dtype=numpy.float64)
     mask = numpy.isfinite(target_mat).all(axis=1)
 
     if numpy.any(mask):
         diff = target_mat[mask] - robust_loc
-        # Efficient Mahalanobis: sum((diff @ precision) * diff, axis=1)
         distances[mask] = numpy.einsum('ij,jk,ik->i', diff, robust_prec, diff)
 
     bad_indices = numpy.where(distances > chi2_thresh)[0]
     bad_quarters = set()
 
-    # Collect ALL outliers first, then sort by severity (distance) to return top K
+    # Collect outliers with limited logging
     all_outlier_logs = []
 
     if len(bad_indices) > 0:
         for idx in bad_indices:
             q = q_ids[idx]
             bad_quarters.add(q)
-            if dates:
+            if dates and len(all_outlier_logs) < MAX_CORRECTIONS_LOG * 2:
                 all_outlier_logs.append({
                     "ticker": ticker,
                     "date": dates[idx] if idx < len(dates) else None,
@@ -399,40 +419,20 @@ def mahalanobis_filter(
                     "error_type": "mahalanobis_outlier",
                     "dist": float(distances[idx]),
                     "threshold": chi2_thresh,
-                    "_severity": float(distances[idx])  # For sorting
+                    "_severity": float(distances[idx])
                 })
 
-        # Sort by severity (highest distance first) and keep top K
+        # Sort by severity and keep top K
         all_outlier_logs.sort(key=lambda x: x["_severity"], reverse=True)
         for log_entry in all_outlier_logs[:MAX_CORRECTIONS_LOG]:
-            del log_entry["_severity"]  # Remove internal field
+            del log_entry["_severity"]
             logs.append(log_entry)
 
     if not bad_quarters:
         return (working_lf.collect() if not is_lazy else working_lf, logs)
 
-    # Build correction map using target_z_df
-    # Ensure target_z_df is a LazyFrame for compatibility with lazy joins
-    target_z_lf = target_z_df if isinstance(target_z_df, polars.LazyFrame) else target_z_df.lazy()
-
-    corrected_map = (
-        target_z_lf
-        .sort(date_col)
-        .select(["_quarter_id"] + valid_cols)
-        .with_columns([
-            polars.when(polars.col("_quarter_id").is_in(bad_quarters))
-            .then(None)
-            .otherwise(polars.col(c))
-            .alias(c)
-            for c in valid_cols
-        ])
-        .with_columns([
-            polars.col(c).forward_fill().alias(f"{c}_corrected")
-            for c in valid_cols
-        ])
-    )
-
-    # OPTIMIZATION: Use integer quarter ID (matches what we stored)
+    # Build correction map from scratch using working_lf data
+    # This avoids needing to store the full data in sector_model
     daily_w_quarter = (
         working_lf
         .with_columns(
@@ -441,15 +441,40 @@ def mahalanobis_filter(
         )
     )
 
-    # Get original columns list efficiently
+    # Get quarterly averages for valid_cols (for correction source)
+    quarterly_data = (
+        daily_w_quarter
+        .group_by("_quarter_id")
+        .agg([polars.col(c).last() for c in valid_cols if c in schema_cols])
+        .sort("_quarter_id")
+    )
+
+    # Build correction by nulling bad quarters and forward filling
+    corrected_quarterly = (
+        quarterly_data
+        .with_columns([
+            polars.when(polars.col("_quarter_id").is_in(list(bad_quarters)))
+            .then(None)
+            .otherwise(polars.col(c))
+            .alias(c)
+            for c in valid_cols if c in schema_cols
+        ])
+        .with_columns([
+            polars.col(c).forward_fill().alias(f"{c}_corrected")
+            for c in valid_cols if c in schema_cols
+        ])
+    )
+
+    # Get original columns list
     orig_cols = list(schema_cols)
 
+    # Join and apply corrections
     final_df = (
         daily_w_quarter
-        .join(corrected_map, on="_quarter_id", how="left")
+        .join(corrected_quarterly, on="_quarter_id", how="left", suffix="_q")
         .with_columns([
             polars.coalesce([polars.col(f"{c}_corrected"), polars.col(c)]).alias(c)
-            for c in valid_cols
+            for c in valid_cols if c in schema_cols
         ])
         .select(orig_cols)
     )

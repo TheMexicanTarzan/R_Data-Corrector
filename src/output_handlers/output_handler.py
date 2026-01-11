@@ -1,12 +1,118 @@
 """
 Output handler for saving corrected fundamental data to CSV or Parquet files.
+
+MEMORY OPTIMIZATION: Uses streaming save pattern that collects and writes
+each ticker individually, then immediately releases memory before moving
+to the next ticker.
 """
 import polars as pl
 from pathlib import Path
 from typing import Union, Tuple, Dict, Optional, Literal
 import logging
+import gc
 
 logger = logging.getLogger(__name__)
+
+
+def save_corrected_data_streaming(
+    clean_data_dict: Dict[str, Tuple[Union[pl.LazyFrame, pl.DataFrame], pl.LazyFrame]],
+    output_directory: Union[str, Path],
+    file_format: Literal["csv", "parquet"] = "csv",
+    create_directory: bool = True,
+    overwrite: bool = True
+) -> int:
+    """
+    Save corrected fundamental data using STREAMING pattern.
+
+    MEMORY OPTIMIZATION: Instead of keeping all collected DataFrames in memory,
+    this function:
+    1. Collects one ticker at a time
+    2. Writes it to disk immediately
+    3. Deletes the DataFrame from memory
+    4. Runs garbage collection periodically
+
+    This dramatically reduces peak memory usage during the save phase.
+
+    Returns:
+        int: Number of files successfully saved
+    """
+    if file_format not in ["csv", "parquet"]:
+        raise ValueError(f"file_format must be 'csv' or 'parquet', got '{file_format}'")
+
+    output_dir = Path(output_directory)
+
+    if not output_dir.exists():
+        if create_directory:
+            logger.info(f"Creating output directory: {output_dir}")
+            output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            raise FileNotFoundError(f"Output directory does not exist: {output_dir}")
+
+    total_files = len(clean_data_dict)
+    saved_count = 0
+    failed_count = 0
+
+    logger.info(f"Streaming save: {total_files} files as {file_format.upper()} to {output_dir}")
+
+    # Process in batches for GC efficiency
+    GC_BATCH_SIZE = 100
+
+    for idx, (filename, data_tuple) in enumerate(clean_data_dict.items(), start=1):
+        try:
+            if not isinstance(data_tuple, tuple) or len(data_tuple) < 1:
+                logger.warning(f"Skipping {filename}: Invalid data structure")
+                continue
+
+            ticker_data = data_tuple[0]
+
+            if not isinstance(ticker_data, (pl.LazyFrame, pl.DataFrame)):
+                logger.warning(f"Skipping {filename}: Expected LazyFrame or DataFrame")
+                continue
+
+            # Determine output filename
+            original_stem = Path(filename).stem
+            output_filename = f"{original_stem}.{file_format}"
+            output_path = output_dir / output_filename
+
+            if output_path.exists() and not overwrite:
+                saved_count += 1
+                continue
+
+            # STREAMING: Collect only this ticker
+            if isinstance(ticker_data, pl.LazyFrame):
+                df = ticker_data.collect()
+            else:
+                df = ticker_data
+
+            # Write immediately
+            if file_format == "csv":
+                df.write_csv(output_path)
+            else:
+                df.write_parquet(output_path, compression="snappy", use_pyarrow=False)
+
+            saved_count += 1
+
+            # MEMORY FIX: Delete the DataFrame immediately after writing
+            del df
+
+            # Log progress periodically
+            if idx % 500 == 0:
+                logger.info(f"Progress: {idx}/{total_files} files saved ({idx/total_files*100:.1f}%)")
+
+            # MEMORY FIX: Run GC every batch
+            if idx % GC_BATCH_SIZE == 0:
+                gc.collect()
+
+        except Exception as e:
+            logger.error(f"Error saving {filename}: {e}")
+            failed_count += 1
+            continue
+
+    # Final GC
+    gc.collect()
+
+    logger.info(f"Streaming save complete: {saved_count}/{total_files} files saved, {failed_count} failed")
+    return saved_count
 
 
 def save_corrected_data(

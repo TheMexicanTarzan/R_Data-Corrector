@@ -3,6 +3,7 @@ import os
 import glob
 from pathlib import Path
 from typing import Union, Optional, Tuple
+import gc
 
 # Get the directory where this module is located
 _MODULE_DIR = Path(__file__).parent.resolve()
@@ -10,6 +11,10 @@ _MODULE_DIR = Path(__file__).parent.resolve()
 _PROJECT_ROOT = _MODULE_DIR.parent.parent
 data_dir = str(_PROJECT_ROOT / "Input" / "Data")
 metadata_dir = str(_PROJECT_ROOT / "Input" / "Universe_Information" / "Universe_Information.csv")
+
+# MEMORY OPTIMIZATION: Global metadata reference to avoid replication
+# This ensures all tickers share the exact same metadata object reference
+_GLOBAL_METADATA_LF = None
 
 # ============================================================================
 # 1. DEFINE SCHEMAS
@@ -108,31 +113,34 @@ def read_csv_files_to_polars(
     """
     Reads CSV files from a directory into a dictionary of Polars frames.
 
+    MEMORY OPTIMIZATION: Uses a global metadata reference to ensure all tickers
+    share the exact same metadata object, avoiding any potential duplication
+    or reference counting issues.
+
     Returns:
         dict: Keys are filenames. Values are Tuples: (TickerData, Metadata)
               - TickerData: LazyFrame or DataFrame of price history
-              - Metadata: LazyFrame containing the single row of info for that ticker
+              - Metadata: LazyFrame containing metadata (shared reference)
     """
+    global _GLOBAL_METADATA_LF
 
-    # 1. Prepare Metadata
-    # We scan the metadata file once. We will filter it later for each ticker.
-    try:
-        # Note: We infer schema length 0 to force using our strict schema,
-        # or we can allow inference if the file is messy. Here we enforce schema overrides.
-        full_metadata_lf = polars.scan_csv(
-            metadata_path,
-            schema_overrides=METADATA_SCHEMA,
-            infer_schema_length=10000
-        )
+    # 1. Prepare Metadata (load once, share globally)
+    if _GLOBAL_METADATA_LF is None:
+        try:
+            _GLOBAL_METADATA_LF = polars.scan_csv(
+                metadata_path,
+                schema_overrides=METADATA_SCHEMA,
+                infer_schema_length=10000
+            )
 
-        # Convert ipoDate from String to Date if needed
-        full_metadata_lf = full_metadata_lf.with_columns(
-            polars.col("ipoDate").str.to_date("%Y-%m-%d", strict=False).alias("ipoDate")
-        )
-    except Exception as e:
-        print(f"Warning: Could not load metadata from {metadata_path}. Error: {e}")
-        # Create an empty dummy LF if metadata fails, to prevent crash
-        full_metadata_lf = polars.LazyFrame(schema=METADATA_SCHEMA)
+            # Convert ipoDate from String to Date if needed
+            _GLOBAL_METADATA_LF = _GLOBAL_METADATA_LF.with_columns(
+                polars.col("ipoDate").str.to_date("%Y-%m-%d", strict=False).alias("ipoDate")
+            )
+            print(f"Loaded metadata from {metadata_path}")
+        except Exception as e:
+            print(f"Warning: Could not load metadata from {metadata_path}. Error: {e}")
+            _GLOBAL_METADATA_LF = polars.LazyFrame(schema=METADATA_SCHEMA)
 
     # 2. Locate Data Files
     search_path = os.path.join(directory_path, file_pattern)
@@ -159,10 +167,11 @@ def read_csv_files_to_polars(
     results = {}
     print(f"Processing {len(files_to_process)} files...")
 
-    for file_path in files_to_process:
-        filename = os.path.basename(file_path)
+    # MEMORY OPTIMIZATION: Cache schema lookups
+    schema_cache = {}
 
-        # Extract ticker symbol from filename (e.g., "AAPL.csv" -> "AAPL")
+    for idx, file_path in enumerate(files_to_process):
+        filename = os.path.basename(file_path)
         ticker_symbol = os.path.splitext(filename)[0]
 
         try:
@@ -199,10 +208,6 @@ def read_csv_files_to_polars(
                 )
 
             if date_cols_to_convert:
-                # Try multiple date formats to handle different CSV formats
-                # First attempt: MM/DD/YYYY (e.g., "07/01/2020")
-                # Second attempt: YYYY-MM-DD (e.g., "2020-07-01")
-                # Third attempt: DD/MM/YYYY (e.g., "01/07/2020")
                 date_expressions = [
                     polars.coalesce(
                         polars.col(c).str.to_date("%m/%d/%Y", strict=False),
@@ -213,12 +218,17 @@ def read_csv_files_to_polars(
                 ]
                 frame = frame.with_columns(date_expressions)
 
-            # --- PART B: Store Result with Full Metadata ---
-            # Pass the full metadata LazyFrame so filters can query peer tickers
-            # (e.g., mahalanobis_filter needs to find all tickers in the same sector)
-            results[filename] = (frame, full_metadata_lf)
+            # --- PART B: Store Result with SHARED Metadata Reference ---
+            # MEMORY OPTIMIZATION: Use the global metadata reference
+            results[filename] = (frame, _GLOBAL_METADATA_LF)
 
         except Exception as e:
             print(f"Error processing {filename}: {e}")
 
+        # MEMORY OPTIMIZATION: Periodic GC during loading
+        if idx > 0 and idx % 5000 == 0:
+            gc.collect()
+            print(f"Loaded {idx}/{len(files_to_process)} files...")
+
+    print(f"Successfully loaded {len(results)} files")
     return results
