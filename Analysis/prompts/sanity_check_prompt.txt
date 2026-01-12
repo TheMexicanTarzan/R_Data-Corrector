@@ -5,7 +5,7 @@ Act as a Senior financial analyst specializing in financial data. You will be pr
 Each one of the error logs in the provided JSON file was detected with a hard constraint which upholds the intrinsic logic of financial data.
 
 # Objective
-Your job is to thoroughly research each one of the error logs, and determine if there is commonality within the tickers which exhibit each type of error. Also give me a list of the errors that are NOT false positives.
+Your job is to thoroughly research each one of the error logs, and determine if there is commonality within the tickers which exhibit each type of error.
 
 # Specific instructions
 1. Extract the list of tickers, dates, and specific anomaly details from the provided JSON file or input text.
@@ -17,5 +17,5 @@ Your job is to thoroughly research each one of the error logs, and determine if 
 
 # Requirements
 1. Provide the research report analyzing the errors found and their nature
-2. Provide a list of the specific errors that are NOT false positives
+2. Provide a list of the specific errors that are possibly false positives
 3. Finish this report with a table where you group every ticker in the error logs by error types and characteristics that may make this company prone to the detected error type.
