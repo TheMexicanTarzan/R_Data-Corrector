@@ -1199,10 +1199,14 @@ def load_original_on_demand(file_path, schema_overrides=None):
             infer_schema_length=10000
         )
 
-        # Convert date columns
+        # Convert date columns - try multiple formats like csv_reader.py
         if date_cols_to_convert:
             date_expressions = [
-                polars.col(c).str.to_date("%m/%d/%Y", strict=False).alias(c)
+                polars.coalesce(
+                    polars.col(c).str.to_date("%m/%d/%Y", strict=False),
+                    polars.col(c).str.to_date("%Y-%m-%d", strict=False),
+                    polars.col(c).str.to_date("%d/%m/%Y", strict=False)
+                ).alias(c)
                 for c in date_cols_to_convert
             ]
             frame = frame.with_columns(date_expressions)
@@ -1218,25 +1222,67 @@ _original_cache = {}
 _CACHE_MAX_SIZE = 5
 
 
+def _normalize_ticker_key(ticker: str, data_dict: dict) -> Optional[str]:
+    """
+    Find the correct key for a ticker in a dictionary.
+
+    Handles the mismatch between ticker values from logs (e.g., "AAPL")
+    and dictionary keys from file loading (e.g., "AAPL.csv").
+
+    Args:
+        ticker: The ticker symbol (may or may not have extension)
+        data_dict: Dictionary with ticker keys
+
+    Returns:
+        The matching key if found, None otherwise
+    """
+    if not ticker:
+        return None
+
+    # Try exact match first
+    if ticker in data_dict:
+        return ticker
+
+    # Try with .csv extension
+    ticker_csv = f"{ticker}.csv"
+    if ticker_csv in data_dict:
+        return ticker_csv
+
+    # Try with .parquet extension
+    ticker_parquet = f"{ticker}.parquet"
+    if ticker_parquet in data_dict:
+        return ticker_parquet
+
+    # Try without extension (in case ticker has extension but dict doesn't)
+    ticker_base = ticker.replace(".csv", "").replace(".parquet", "")
+    if ticker_base in data_dict:
+        return ticker_base
+
+    return None
+
+
 def get_original_dataframe(ticker: str, file_paths: dict):
     """Get original dataframe, loading on-demand with caching."""
     global _original_cache
 
-    if ticker in _original_cache:
-        return _original_cache[ticker]
-
-    if ticker not in file_paths:
+    # Normalize the ticker key
+    normalized_key = _normalize_ticker_key(ticker, file_paths)
+    if normalized_key is None:
         return None
 
+    # Check cache with normalized key
+    if normalized_key in _original_cache:
+        return _original_cache[normalized_key]
+
     # Load on demand
-    df = load_original_on_demand(file_paths[ticker])
+    df = load_original_on_demand(file_paths[normalized_key])
 
     if df is not None:
         # Evict oldest if cache full
         if len(_original_cache) >= _CACHE_MAX_SIZE:
             oldest = next(iter(_original_cache))
             del _original_cache[oldest]
-        _original_cache[ticker] = df
+        _original_cache[normalized_key] = df
 
     return df
 
@@ -1485,9 +1531,10 @@ def create_app(
         if not ticker:
             return []
 
-        # Get columns from cleaned dataframes
-        if ticker in cleaned_dataframes:
-            df = cleaned_dataframes[ticker]
+        # Normalize ticker key for cleaned_dataframes lookup
+        cleaned_key = _normalize_ticker_key(ticker, cleaned_dataframes)
+        if cleaned_key and cleaned_key in cleaned_dataframes:
+            df = cleaned_dataframes[cleaned_key]
             if isinstance(df, polars.LazyFrame):
                 cols = df.collect_schema().names()
             else:
@@ -1547,9 +1594,10 @@ def create_app(
         if "(" in col_involved:
             col_involved = col_involved.split("(")[0].strip()
 
-        # Verify column exists
-        if ticker in cleaned_dataframes:
-            df = cleaned_dataframes[ticker]
+        # Verify column exists - normalize ticker key
+        cleaned_key = _normalize_ticker_key(ticker, cleaned_dataframes)
+        if cleaned_key and cleaned_key in cleaned_dataframes:
+            df = cleaned_dataframes[cleaned_key]
             if isinstance(df, polars.LazyFrame):
                 cols = df.collect_schema().names()
             else:
@@ -1589,7 +1637,10 @@ def create_app(
 
         # MEMORY FIX: Get original data on-demand
         original_df = get_original_dataframe(ticker, original_file_paths)
-        cleaned_df = cleaned_dataframes.get(ticker)
+
+        # Normalize ticker key for cleaned_dataframes lookup
+        cleaned_key = _normalize_ticker_key(ticker, cleaned_dataframes)
+        cleaned_df = cleaned_dataframes.get(cleaned_key) if cleaned_key else None
 
         if original_df is None or cleaned_df is None:
             fig.update_layout(
