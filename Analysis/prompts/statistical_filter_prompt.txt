@@ -13,10 +13,10 @@ Your job is to thoroughly research each one of the error logs, and determine whi
 3. Search reputable financial news archives and historical market data for each ticker on the specified dates to find reports of significant market events, volatility, or trading halts.
 4. Compare the findings against the anomaly details to determine if an actual event explains the outlier (classifying it as a False Positive).
 5. Assign a confidence rating to each analyzed log based on the strength of the evidence found use the following scale:
-	- Certain: 90%<confidence that this log is not a false positive
-	- Confident: 80%<confidence that this log is not a false positive
-	- Could use more evidence: 60%<confident that this log is not a false positive
-	- Uncertain: 60%>confident that this log is a not false positive
+	- Certain: 90%<confidence that this log is a false positive
+	- Confident: 80%<confidence that this log is a false positive
+	- Could use more evidence: 60%<confident that this log is a false positive
+	- Uncertain: 60%>confident that this log is a false positive
 6. Analyze the collective results to determine if the false positives or unexplained errors show systemic patterns or appear random.
 7. Present every single error which is not in the uncertain category from the most confident to the least confident.
 
