@@ -53,7 +53,10 @@ FINANCIAL_DATA_SCHEMA = {
     'f_fiscal_year': polars.Int32, 'f_fiscal_quarter': polars.Int32, 'd_frequency': polars.Int32,
     's_split_date_numerator': polars.Float32, 's_split_date_denominator': polars.Float32,
     'c_rank': polars.Int64, 'c_sector_rank': polars.Int64, 'c_industry_rank': polars.Int64,
-    'c_count': polars.Int64, 'c_row_number': polars.Int64
+    'c_count': polars.Int64, 'c_row_number': polars.Int64,
+
+    # --- Booleans (Added by data correction pipeline) ---
+    'data_warning': polars.Boolean
 }
 
 METADATA_SCHEMA = {
