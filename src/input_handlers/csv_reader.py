@@ -22,19 +22,20 @@ _GLOBAL_METADATA_LF = None
 
 FINANCIAL_DATA_SCHEMA = {
     # --- Market Data ---
+    # Note: Volume/transaction columns use Float64 to handle CSV values with decimal points (e.g., "33918.0")
     'm_open': polars.Float64, 'm_high': polars.Float64, 'm_low': polars.Float64, 'm_close': polars.Float64,
-    'm_volume': polars.Int64, 'm_vwap': polars.Float64, 'm_transactions': polars.Int64,
+    'm_volume': polars.Float64, 'm_vwap': polars.Float64, 'm_transactions': polars.Float64,
     'm_date': polars.Date,
 
     # --- Split Adjusted ---
     'm_open_split_adjusted': polars.Float64, 'm_high_split_adjusted': polars.Float64,
     'm_low_split_adjusted': polars.Float64, 'm_close_split_adjusted': polars.Float64,
-    'm_volume_split_adjusted': polars.Int64, 'm_vwap_split_adjusted': polars.Float64,
+    'm_volume_split_adjusted': polars.Float64, 'm_vwap_split_adjusted': polars.Float64,
 
     # --- Dividend & Split Adjusted ---
     'm_open_dividend_and_split_adjusted': polars.Float64, 'm_high_dividend_and_split_adjusted': polars.Float64,
     'm_low_dividend_and_split_adjusted': polars.Float64, 'm_close_dividend_and_split_adjusted': polars.Float64,
-    'm_volume_dividend_and_split_adjusted': polars.Int64, 'm_vwap_dividend_and_split_adjusted': polars.Float64,
+    'm_volume_dividend_and_split_adjusted': polars.Float64, 'm_vwap_dividend_and_split_adjusted': polars.Float64,
 
     # --- Identifiers ---
     'ticker': polars.String, 'company_name': polars.String, 'sector': polars.String, 'industry': polars.String,
